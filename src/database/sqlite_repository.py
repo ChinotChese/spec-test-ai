@@ -27,6 +27,13 @@ SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 REQUIREMENT_STATUSES = ("pending", "approved", "rejected")
 
+# Requirement columns that update_requirement() may change (status has its own method).
+_REQUIREMENT_CONTENT_FIELDS = frozenset({
+    "type", "statement", "priority",
+    "feature", "stimulus_or_condition", "response",
+    "nfr_category", "verification_method", "acceptance_measure",
+})
+
 _NOW = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
 
 
@@ -99,7 +106,7 @@ class SQLiteRepository:
         return _row_to_dict(row)
 
     def list_documents(self) -> list[dict[str, Any]]:
-        rows = self.conn.execute("SELECT * FROM documents ORDER BY created_at, id").fetchall()
+        rows = self.conn.execute("SELECT * FROM documents ORDER BY created_at, rowid").fetchall()
         return [dict(r) for r in rows]
 
     def delete_document(self, document_id: str) -> None:
@@ -171,11 +178,11 @@ class SQLiteRepository:
     def list_passages(self, document_id: str | None = None) -> list[dict[str, Any]]:
         if document_id is None:
             rows = self.conn.execute(
-                "SELECT * FROM source_passages ORDER BY document_id, page, created_at"
+                "SELECT * FROM source_passages ORDER BY document_id, page, created_at, rowid"
             ).fetchall()
         else:
             rows = self.conn.execute(
-                "SELECT * FROM source_passages WHERE document_id = ? ORDER BY page, created_at",
+                "SELECT * FROM source_passages WHERE document_id = ? ORDER BY page, created_at, rowid",
                 (document_id,),
             ).fetchall()
         return [dict(r) for r in rows]
@@ -185,7 +192,7 @@ class SQLiteRepository:
         rows = self.conn.execute(
             "SELECT r.* FROM requirements r "
             "JOIN requirement_evidence re ON re.requirement_id = r.id "
-            "WHERE re.passage_id = ? ORDER BY r.created_at, r.id",
+            "WHERE re.passage_id = ? ORDER BY r.created_at, r.rowid",
             (passage_id,),
         ).fetchall()
         return [self._requirement_from_row(r) for r in rows]
@@ -196,19 +203,47 @@ class SQLiteRepository:
         self,
         type: str,
         statement: str,
+        *,
+        priority: str,
         evidence: Sequence[dict[str, Any] | str] = (),
+        feature: str | None = None,
+        stimulus_or_condition: str | None = None,
+        response: str | None = None,
+        nfr_category: str | None = None,
+        verification_method: str | None = None,
+        acceptance_measure: str | None = None,
         status: str = "pending",
         requirement_id: str | None = None,
     ) -> str:
-        """Insert a requirement. Evidence items are passage ids or dicts with "passage_id"."""
+        """Insert a requirement.
+
+        Keyword names match schemas.requirement.RequirementDraft, so a draft
+        can be saved with `repo.add_requirement(**draft.model_dump())`.
+        Evidence items are passage ids or dicts with "passage_id" (+ "quote").
+        """
         self._check_status(status)
         evidence_list = self._normalize_evidence(evidence)
         requirement_id = requirement_id or _new_id()
+        values = {
+            "id": requirement_id,
+            "type": type,
+            "statement": statement,
+            "status": status,
+            "priority": priority,
+            "feature": feature,
+            "stimulus_or_condition": stimulus_or_condition,
+            "response": response,
+            "nfr_category": nfr_category,
+            "verification_method": verification_method,
+            "acceptance_measure": acceptance_measure,
+        }
+        columns = ", ".join(values)
+        placeholders = ", ".join("?" * len(values))
         try:
             with self.conn:
                 self.conn.execute(
-                    "INSERT INTO requirements (id, type, statement, status) VALUES (?, ?, ?, ?)",
-                    (requirement_id, type, statement, status),
+                    f"INSERT INTO requirements ({columns}) VALUES ({placeholders})",
+                    list(values.values()),
                 )
                 self._insert_evidence(requirement_id, evidence_list)
         except sqlite3.IntegrityError as e:
@@ -219,19 +254,21 @@ class SQLiteRepository:
         self,
         requirement_id: str,
         *,
-        type: str | None = None,
-        statement: str | None = None,
         evidence: Sequence[dict[str, Any] | str] | None = None,
+        **fields: Any,
     ) -> None:
-        """Update fields; passing `evidence` replaces the whole evidence list."""
-        sets: list[str] = []
-        params: list[Any] = []
-        if type is not None:
-            sets.append("type = ?")
-            params.append(type)
-        if statement is not None:
-            sets.append("statement = ?")
-            params.append(statement)
+        """Update content fields; passing `evidence` replaces the whole evidence list.
+
+        Allowed fields: type, statement, priority, feature, stimulus_or_condition,
+        response, nfr_category, verification_method, acceptance_measure.
+        Pass a field as None to clear it (e.g. stimulus_or_condition=None).
+        Use set_requirement_status() to change the review status.
+        """
+        unknown = set(fields) - _REQUIREMENT_CONTENT_FIELDS
+        if unknown:
+            raise RepositoryError(f"Unknown requirement fields: {sorted(unknown)}")
+        sets = [f"{name} = ?" for name in fields]
+        params = list(fields.values())
         evidence_list = self._normalize_evidence(evidence) if evidence is not None else None
         if not sets and evidence_list is None:
             return
@@ -269,16 +306,27 @@ class SQLiteRepository:
         ).fetchone()
         return self._requirement_from_row(row) if row is not None else None
 
-    def list_requirements(self, status: str | None = None) -> list[dict[str, Any]]:
-        if status is None:
-            rows = self.conn.execute(
-                "SELECT * FROM requirements ORDER BY created_at, id"
-            ).fetchall()
-        else:
+    def list_requirements(
+        self,
+        status: str | None = None,
+        *,
+        type: str | None = None,
+        feature: str | None = None,
+        nfr_category: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List requirements; every given filter must match."""
+        if status is not None:
             self._check_status(status)
-            rows = self.conn.execute(
-                "SELECT * FROM requirements WHERE status = ? ORDER BY created_at, id", (status,)
-            ).fetchall()
+        filters = {
+            "status": status, "type": type, "feature": feature, "nfr_category": nfr_category
+        }
+        active = {k: v for k, v in filters.items() if v is not None}
+        where = " AND ".join(f"{k} = ?" for k in active)
+        rows = self.conn.execute(
+            f"SELECT * FROM requirements {'WHERE ' + where if where else ''} "
+            "ORDER BY created_at, rowid",
+            list(active.values()),
+        ).fetchall()
         return [self._requirement_from_row(r) for r in rows]
 
     def get_approved_requirements(self) -> list[dict[str, Any]]:
@@ -336,7 +384,7 @@ class SQLiteRepository:
         return self._srs_run_from_row(row) if row is not None else None
 
     def list_srs_runs(self) -> list[dict[str, Any]]:
-        rows = self.conn.execute("SELECT * FROM srs_runs ORDER BY created_at, id").fetchall()
+        rows = self.conn.execute("SELECT * FROM srs_runs ORDER BY created_at, rowid").fetchall()
         return [self._srs_run_from_row(r) for r in rows]
 
     def delete_srs_run(self, run_id: str) -> None:

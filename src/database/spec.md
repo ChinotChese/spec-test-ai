@@ -7,6 +7,8 @@
 | [schema.sql](schema.sql) | Định nghĩa bảng, khóa ngoại, ràng buộc, index |
 | [sqlite_repository.py](sqlite_repository.py) | Class `SQLiteRepository`: toàn bộ thao tác đọc/ghi |
 
+Model Pydantic tương ứng được mô tả trong [schemas/spec.md](../schemas/spec.md).
+
 ---
 
 ## 1. Mô hình dữ liệu
@@ -38,6 +40,13 @@ erDiagram
         text type
         text statement
         text status
+        text priority
+        text feature
+        text stimulus_or_condition
+        text response
+        text nfr_category
+        text verification_method
+        text acceptance_measure
         text created_at
         text updated_at
     }
@@ -104,18 +113,44 @@ Index: `(document_id, page)`.
 
 ### 2.3 `requirements`
 
-Requirement được trích xuất, chờ người review.
+Requirement được trích xuất, chờ người review. Các cột khớp với `RequirementDraft` / `Requirement` trong [schemas/requirement.py](../schemas/requirement.py), và mang đủ thông tin để đặt requirement vào đúng mục của SRS:
+
+- `functional` → mục 5 (và 3), gom theo `feature`.
+- `nonfunctional` → mục 6, gom theo `nfr_category`.
 
 | Cột | Kiểu | Ràng buộc | Ghi chú |
 |---|---|---|---|
 | `id` | TEXT | PK | |
-| `type` | TEXT | NOT NULL | Ví dụ `functional`, `non-functional`. Database không giới hạn giá trị |
-| `statement` | TEXT | NOT NULL | Nội dung requirement |
+| `type` | TEXT | NOT NULL, CHECK ∈ {`functional`, `nonfunctional`} | |
+| `statement` | TEXT | NOT NULL | Câu dạng "shall" |
 | `status` | TEXT | NOT NULL, mặc định `pending`, CHECK ∈ {`pending`, `approved`, `rejected`} | |
+| `priority` | TEXT | NOT NULL, CHECK ∈ {`must`, `should`, `could`, `wont`} | |
+| `feature` | TEXT | | *Chỉ FR, bắt buộc.* Tên feature, dùng cho mục 3.N / 5.N |
+| `stimulus_or_condition` | TEXT | | *Chỉ FR, tùy chọn.* Sự kiện hoặc điều kiện kích hoạt (5.N.2) |
+| `response` | TEXT | | *Chỉ FR, tùy chọn.* Phản hồi của hệ thống (5.N.2) |
+| `nfr_category` | TEXT | | *Chỉ NFR, bắt buộc.* `Performance`, `Security` hoặc nhóm khác (6.N) |
+| `verification_method` | TEXT | CHECK ∈ {`test`, `inspection`, `analysis`, `demonstration`} | *Chỉ NFR, bắt buộc* |
+| `acceptance_measure` | TEXT | | *Chỉ NFR, bắt buộc.* Ngưỡng đo được, ví dụ `p95 <= 2 s` |
 | `created_at` | TEXT | NOT NULL, mặc định là thời điểm tạo | |
 | `updated_at` | TEXT | NOT NULL | Tự cập nhật khi sửa nội dung hoặc đổi trạng thái |
 
-Index: `status`.
+Ràng buộc cấp bảng (vi phạm thì lỗi báo đúng tên ràng buộc):
+
+| Tên | Quy tắc |
+|---|---|
+| `functional_fields` | FR phải có `feature`; không được có `nfr_category`, `verification_method`, `acceptance_measure` |
+| `nonfunctional_fields` | NFR phải có `nfr_category`, `verification_method`, `acceptance_measure`; không được có `feature`, `stimulus_or_condition`, `response` |
+| `stimulus_response_pair` | `stimulus_or_condition` và `response` phải cùng có giá trị hoặc cùng NULL |
+
+Ví dụ dữ liệu:
+
+| id | type | priority | feature | stimulus_or_condition | response | nfr_category | verification_method | acceptance_measure |
+|---|---|---|---|---|---|---|---|---|
+| REQ-001 | functional | must | Login | User submits valid credentials | Dashboard is shown | NULL | NULL | NULL |
+| REQ-002 | functional | should | Login | NULL | NULL | NULL | NULL | NULL |
+| REQ-003 | nonfunctional | must | NULL | NULL | NULL | Performance | test | p95 <= 2 s |
+
+Index: `status`, `feature`, `nfr_category`. Index trên `feature` và `nfr_category` là partial index, chỉ chứa các dòng khác NULL.
 
 ### 2.4 `srs_runs`
 
@@ -173,6 +208,9 @@ Khóa chính là `(srs_run_id, requirement_id)`. Cặp `(srs_run_id, position)` 
 | Evidence phải trỏ tới passage có thật | ✔ | ✔ (để báo lỗi rõ ràng hơn) |
 | SRS run chỉ chứa requirement có thật | ✔ | ✔ (để báo lỗi rõ ràng hơn) |
 | `status` chỉ nhận 3 giá trị hợp lệ | ✔ | ✔ |
+| `type`, `priority`, `verification_method` chỉ nhận giá trị hợp lệ | ✔ | |
+| FR / NFR có đủ field của loại mình và không có field của loại kia | ✔ | |
+| `stimulus_or_condition` và `response` đi theo cặp | ✔ | |
 | `page >= 1`, `srs_json` là JSON hợp lệ | ✔ | |
 | Mỗi file (theo `file_hash`) chỉ được lưu một lần | ✔ (UNIQUE) | ✔ (trả lại id của document đã có) |
 | **SRS run chỉ chứa requirement đã `approved`** | | ✔ (khóa ngoại không diễn tả được điều kiện này) |
@@ -209,8 +247,15 @@ Các hàm đọc trả về `dict`. Riêng requirement và SRS run được bổ
 {
     "id": "REQ-001",
     "type": "functional",
-    "statement": "Users can log in",
+    "statement": "Upon login with valid credentials, the system shall show the dashboard.",
     "status": "approved",
+    "priority": "must",
+    "feature": "Login",
+    "stimulus_or_condition": "User submits valid credentials",
+    "response": "Dashboard is shown",
+    "nfr_category": None,
+    "verification_method": None,
+    "acceptance_measure": None,
     "created_at": "2026-11-16T08:30:12.345Z",
     "updated_at": "2026-11-16T09:01:00.000Z",
     "evidence": [                                  # theo thứ tự đã thêm
@@ -229,6 +274,15 @@ Các hàm đọc trả về `dict`. Riêng requirement và SRS run được bổ
     "requirement_ids": ["REQ-002", "REQ-001"],     # sắp theo position
 }
 ```
+
+Dict requirement có thể validate thẳng thành model, không cần chuyển đổi gì thêm:
+
+```python
+from schemas.requirement import Requirement
+req = Requirement.model_validate(repo.get_requirement("REQ-001"))
+```
+
+Các hàm `list_*` trả về theo thứ tự tạo. Nếu hai bản ghi có cùng `created_at`, thứ tự chèn (`rowid`) quyết định.
 
 ---
 
@@ -272,11 +326,11 @@ Mọi lỗi vi phạm quy tắc đều raise `RepositoryError`.
 
 | Hàm | Mô tả |
 |---|---|
-| `add_requirement(type, statement, evidence=(), status="pending", requirement_id=None) -> str` | Thêm requirement. Mỗi phần tử của `evidence` là một chuỗi `passage_id` hoặc một dict `{"passage_id", "quote"}` |
-| `update_requirement(id, *, type=None, statement=None, evidence=None)` | Sửa nội dung. Nếu truyền `evidence` thì danh sách evidence cũ bị **thay toàn bộ** |
+| `add_requirement(type, statement, *, priority, evidence=(), feature=None, stimulus_or_condition=None, response=None, nfr_category=None, verification_method=None, acceptance_measure=None, status="pending", requirement_id=None) -> str` | Thêm requirement. Tên tham số trùng với field của `RequirementDraft`, nên có thể gọi `repo.add_requirement(**draft.model_dump())`. Mỗi phần tử của `evidence` là một chuỗi `passage_id` hoặc một dict `{"passage_id", "quote"}` |
+| `update_requirement(id, *, evidence=None, **fields)` | Sửa các field nội dung (`type`, `statement`, `priority`, `feature`, `stimulus_or_condition`, `response`, `nfr_category`, `verification_method`, `acceptance_measure`). Truyền `None` để xóa giá trị một field. Nếu truyền `evidence` thì danh sách evidence cũ bị **thay toàn bộ**. Đổi `status` phải dùng `set_requirement_status()` |
 | `set_requirement_status(id, status)` | Đổi trạng thái |
 | `get_requirement(id)` | Lấy requirement kèm `evidence` |
-| `list_requirements(status=None)` | Danh sách requirement, có thể lọc theo trạng thái |
+| `list_requirements(status=None, *, type=None, feature=None, nfr_category=None)` | Danh sách requirement. Các bộ lọc được kết hợp bằng AND |
 | `get_approved_requirements()` | Viết tắt của `list_requirements("approved")` |
 | `delete_requirement(id)` | Xóa requirement. Raise lỗi nếu nó đã nằm trong một SRS run |
 
@@ -304,10 +358,14 @@ with SQLiteRepository("output/spectest.db") as repo:
 
     # 2–3. Lưu requirement đã qua kiểm tra evidence, trạng thái ban đầu là pending
     req = repo.add_requirement(
-        "functional", "Users can log in",
+        "functional", "Upon login, the system shall show the dashboard.",
+        priority="must",
+        feature="Login",
         evidence=[{"passage_id": p1, "quote": "users log in"}],
         requirement_id="REQ-001",
     )
+    # Hoặc lưu thẳng output của extractor:
+    #   repo.add_requirement(**draft.model_dump())     # draft: RequirementDraft
 
     # 4. Người review duyệt requirement
     repo.set_requirement_status(req, "approved")
@@ -325,6 +383,6 @@ with SQLiteRepository("output/spectest.db") as repo:
 
 ## 7. Lưu ý vận hành
 
-- **Đổi schema:** chưa có cơ chế migration. `CREATE TABLE IF NOT EXISTS` không sửa bảng đã tồn tại. Khi đổi schema, cần xóa file `.db` cũ hoặc tự viết script migration. Một file `.db` tạo từ bản schema cũ (còn cột `evidence_json` và `requirement_ids_json`) sẽ không tương thích với bản này.
+- **Đổi schema:** chưa có cơ chế migration. `CREATE TABLE IF NOT EXISTS` không sửa bảng đã tồn tại. Khi đổi schema, cần xóa file `.db` cũ hoặc tự viết script migration. Một file `.db` tạo từ bản schema cũ sẽ không tương thích với bản này. Bản cũ là bản còn cột `evidence_json` / `requirement_ids_json`, hoặc bản mà bảng `requirements` chưa có 7 cột `priority` … `acceptance_measure`.
 - **Một connection, một luồng:** mỗi `SQLiteRepository` giữ một `sqlite3.Connection`. Mặc định Python không cho dùng chung connection này giữa các thread, nên mỗi thread nên tạo repository riêng.
 - **Yêu cầu SQLite có JSON1:** cột `srs_json` dùng `json_valid`. JSON1 được tích hợp sẵn từ SQLite 3.38. Kiểm tra phiên bản bằng `python -c "import sqlite3; print(sqlite3.sqlite_version)"`.
