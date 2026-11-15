@@ -39,7 +39,7 @@ flowchart TD
 
 - Mỗi tài liệu được xử lý riêng trong **một lần gọi**. Prompt chỉ chứa passage của tài liệu đó, nên requirement không thể trích passage của tài liệu khác.
 - Item không hợp lệ bị **loại, không sửa**, và lý do được ghi vào báo cáo. Một item hỏng không làm mất các item khác.
-- Extractor không ghi DB. Lưu requirement là việc của `requirement_registry`, kiểm tra quote là việc của `evidence_validator`. Cả hai service này chưa triển khai.
+- Extractor không ghi DB. Kiểm tra quote là việc của `services/evidence_validator.py`, lưu requirement là việc của `services/requirement_registry.py` ([services/spec.md](../services/spec.md) mục 2 và 3).
 
 ### 1.2 Gọi Gemini
 
@@ -266,7 +266,7 @@ Các trường hợp đã kiểm tra:
 - **Kết quả dao động giữa các lần chạy**, dù `temperature = 0`. Số requirement của cùng một tài liệu dao động 16–27 qua các phiên bản prompt; model đôi khi gộp nhiều gạch đầu dòng thành một. Bước người review là nơi bắt các lỗi này.
 - **Ít hoặc không có NFR** với các tài liệu chủ yếu nói về tính năng. Với hai email hiện tại, điều này phù hợp: chúng không nêu yêu cầu hiệu năng hay bảo mật. Tuy vậy, "trả lời tiếng Đức/Anh" đang được xếp là FR, dù có thể coi là NFR nhóm Localization.
 - **Một lần gọi cho mỗi tài liệu.** Tài liệu rất dài có thể vượt giới hạn output và gây `MAX_TOKENS`. Chưa chia nhỏ tài liệu.
-- **Không kiểm tra quote, không lưu kết quả.** Hai việc này thuộc `evidence_validator` và `requirement_registry`, đều chưa triển khai.
+- **Không kiểm tra quote, không lưu kết quả.** Hai việc này thuộc `evidence_validator` và `requirement_registry` (bước tiếp theo trong `app.py`).
 - **Không có bước rà soát lần hai** để tìm requirement còn sót. Đây là hướng cải thiện độ bao phủ nếu cần, đổi lại tốn thêm một lần gọi mỗi tài liệu.
 
 ---
@@ -409,4 +409,4 @@ Chạy trên **bản sao** của DB, với 27 requirement đã approve của tà
 - **Cặp stimulus/response và văn xuôi do model viết**, nên vẫn cần người đọc lại trước khi gửi khách. Code chỉ bảo đảm liên kết đúng FR và passage được trích có tồn tại, không bảo đảm câu chữ trung thành với nguồn.
 - **Chưa có khái niệm "dự án".** `get_approved()` trả mọi requirement đã approve. Hiện DB chứa requirement của hai dự án khác nhau (hai email đề xuất). Nếu approve cả hai, lệnh CLI sẽ sinh **một** SRS trộn hai sản phẩm. Cách tạm thời: chỉ approve requirement của một dự án, hoặc gọi `generate()` với danh sách id đã lọc. `GenerationReport.documents` cho biết SRS dựa trên những tài liệu nào.
 - **Model chỉ được gọi lại một lần.** Tài liệu rất lớn (nhiều passage) có thể vượt giới hạn output và gây `MAX_TOKENS`.
-- **Không lưu kết quả.** Lưu vào `srs_runs` (`repo.add_srs_run`) và kiểm tra placeholder `<…>` còn sót thuộc về `srs_validator` / bước export, đều chưa triển khai.
+- **Không lưu kết quả.** Generator không ghi vào `srs_runs` (`repo.add_srs_run`). Việc kiểm tra placeholder còn sót và dò nguồn gốc nằm ở `services/srs_validator.py`, việc xuất file nằm ở `exporters/markdown.py` ([exporters/spec.md](../exporters/spec.md)).

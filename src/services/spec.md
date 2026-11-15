@@ -7,7 +7,7 @@
 | [document_loader.py](document_loader.py) | 1. Đọc tài liệu, lưu passage | ✔ Đã triển khai |
 | [evidence_validator.py](evidence_validator.py) | 3. Kiểm tra evidence (quote có thật trong passage) | ✔ Đã triển khai |
 | [requirement_registry.py](requirement_registry.py) | 3–5. Cấp id, lưu requirement chờ duyệt, approve/reject, lấy requirement đã duyệt | ✔ Đã triển khai |
-| [srs_validator.py](srs_validator.py) | 7. Kiểm tra SRS trước khi export | Chưa triển khai (file trống) |
+| [srs_validator.py](srs_validator.py) | 7. Kiểm tra SRS và dò nguồn gốc từng FR/NFR trước khi export | ✔ Đã triển khai |
 
 Tài liệu liên quan:
 
@@ -403,10 +403,56 @@ Chạy trên DB in-memory, các trường hợp đã kiểm tra:
 
 ---
 
-## 4. Service chưa triển khai
+## 4. `srs_validator.py`
 
-Vai trò dự kiến, suy ra từ `app.py`. Phần này **chưa phải đặc tả cuối cùng**.
+Kiểm tra một SRS đã sinh, và **dò nguồn gốc của từng FR/NFR** về requirement đã approve trong registry. Đây là bước 7 trong `app.py`, chạy trước khi export. [exporters/markdown.py](../exporters/markdown.py) gọi nó tự động.
 
-| Service | Vai trò theo `app.py` | Sẽ dùng |
+### 4.1 Dò nguồn gốc
+
+Schema SRS không có chỗ cho registry id (`RQ-…`), và `app.py` cũng không truyền bảng ánh xạ. Vì vậy validator tự tìm nguồn gốc: generator chép statement nguyên văn, nên mỗi FR/NFR phải khớp **đúng một** requirement đã approve có **cùng loại và cùng statement nguyên văn**. Sau đó validator kiểm tra:
+
+| # | Kiểm tra | Lỗi (ví dụ) |
 |---|---|---|
-| `srs_validator.validate(srs, requirements)` | Kiểm tra SRS trước khi export: đúng `schemas.srs.SRS`, chỉ chứa requirement đã duyệt, không còn placeholder `<...>` | `schemas.srs.SRS`, `SRS.requirement_ids()` |
+| 1 | Có đúng một dòng khớp | `REQ-1.3: no approved functional requirement in the registry has this exact statement` (bịa thêm, statement bị sửa, hoặc requirement đã bị reject sau khi sinh) / `… matches several approved requirements` |
+| 2 | Priority bằng nhau; với NFR, `verification_method` và `acceptance_measure` cũng bằng nhau | `REQ-1.2 (RQ-0002): priority 'must' != registry 'should'` |
+| 3 | `source_ids` đúng bằng danh sách passage evidence của requirement đó, đúng thứ tự | `REQ-1.1 (RQ-0001): source_ids [...] != evidence [...]` |
+| 4 | Evidence đang lưu vẫn hợp lệ (`repo.approval_problems`) | `REQ-… (RQ-…): invalid evidence: …` |
+| 5 | **Mọi** source id trong tài liệu (văn xuôi, feature, sequence, requirement) là passage có thật | `source id DOC-a-P0999 is not a passage in the database` |
+| 6 | Nếu truyền `requirement_map` (từ generator), nó phải khớp với nguồn gốc dò được | `REQ-1.1: requirement_map says RQ-0003, traced origin is RQ-0001` |
+
+Ngoài ra, SRS được validate lại bằng `schemas.srs.SRS`, để bắt cả dict sai cấu trúc lẫn object bị sửa sau khi tạo.
+
+### 4.2 Warning (không chặn)
+
+| Warning | Vì sao không phải lỗi |
+|---|---|
+| Placeholder còn sót, ví dụ `<Project Name>` | `app.py` không truyền tên dự án, nên nếu coi đây là lỗi thì đường mặc định không bao giờ xuất được. Địa chỉ email kiểu `<a@b.de>` không bị coi là placeholder |
+| Mục văn xuôi `unresolved` / `not_applicable`, nhóm NFR không có requirement | Đây là cách tài liệu nói thật rằng nguồn không đề cập |
+| Requirement đã approve trong `requirements` nhưng không có trong SRS | Một DB có thể chứa nhiều dự án (mục 2.9 của [agents/spec.md](../agents/spec.md)) |
+
+### 4.3 API
+
+```python
+from services import srs_validator
+```
+
+| Hàm | Mô tả |
+|---|---|
+| `validate(srs, requirements=None, *, requirement_map=None, repo=None) -> SrsValidationReport` | Kiểm tra; có lỗi thì raise `SrsValidationError` (`.errors`, `.report`). Đây là hàm `app.py` gọi |
+| `check(...)` | Như trên nhưng trả báo cáo, không raise |
+
+`SrsValidationReport`:
+
+| Field | Ý nghĩa |
+|---|---|
+| `srs` | SRS đã validate lại |
+| `trace` | `list[TraceEntry]`: mỗi FR/NFR có `srs_id`, `registry_id`, loại, statement, priority, và `evidence` (passage id, tài liệu, tên file, trang, quote đã lưu, nguyên văn passage) |
+| `requirement_map` | `{srs_id: registry_id}` dò được |
+| `errors`, `warnings`, `ok` | |
+| `passages`, `documents` | Mọi passage được trích và tài liệu của chúng (exporter dùng cho Appendix B) |
+
+`requirements` chỉ dùng để cảnh báo về requirement bị bỏ sót. Nguồn gốc luôn được dò trong **mọi** requirement đã approve của registry.
+
+### 4.4 Test
+
+Xem [exporters/spec.md](../exporters/spec.md) mục 1.9. Trên SRS thật (27 FR), validator dò được nguồn gốc của cả 27/27 requirement, không có lỗi, và có 5 warning.
