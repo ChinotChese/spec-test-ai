@@ -227,3 +227,12 @@ AI-Requirement-Engineering-System/
 contracts/
 rtia/
 
+
+# SpecTestAI app state (contains ingested document text)
+src/data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+src/input/
+src/output/
