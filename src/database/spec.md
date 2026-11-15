@@ -328,6 +328,7 @@ Mọi lỗi vi phạm quy tắc đều raise `RepositoryError`.
 | Hàm | Mô tả |
 |---|---|
 | `add_requirement(type, statement, *, priority, evidence=(), feature=None, stimulus_or_condition=None, response=None, nfr_category=None, verification_method=None, acceptance_measure=None, status="pending", requirement_id=None) -> str` | Thêm requirement. Tên tham số trùng với field của `RequirementDraft`, nên có thể gọi `repo.add_requirement(**draft.model_dump())`. Mỗi phần tử của `evidence` là một chuỗi `passage_id` hoặc một dict `{"passage_id", "quote"}` |
+| `add_requirements_with_sequential_ids(rows, *, prefix, width=4) -> list[str]` | Lưu nhiều requirement **trong một transaction**, cấp id `<prefix><số>` tiếp nối số lớn nhất đang có với cùng prefix (ví dụ `RQ-0040`). Mỗi phần tử của `rows` là dict tham số giống `add_requirement` và không được chứa `requirement_id`. Một dòng lỗi thì không lưu dòng nào. Được `services/requirement_registry.py` sử dụng |
 | `update_requirement(id, *, evidence=None, **fields)` | Sửa các field nội dung (`type`, `statement`, `priority`, `feature`, `stimulus_or_condition`, `response`, `nfr_category`, `verification_method`, `acceptance_measure`). Truyền `None` để xóa giá trị một field. Nếu truyền `evidence` thì danh sách evidence cũ bị **thay toàn bộ**. Đổi `status` phải dùng `set_requirement_status()` |
 | `set_requirement_status(id, status)` | Đổi trạng thái |
 | `get_requirement(id)` | Lấy requirement kèm `evidence` |

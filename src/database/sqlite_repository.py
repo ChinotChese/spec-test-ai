@@ -263,9 +263,71 @@ class SQLiteRepository:
         can be saved with `repo.add_requirement(**draft.model_dump())`.
         Evidence items are passage ids or dicts with "passage_id" (+ "quote").
         """
+        requirement_id = requirement_id or _new_id()
+        try:
+            with self.conn:
+                self._insert_requirement(
+                    requirement_id, type, statement, priority=priority, evidence=evidence,
+                    feature=feature, stimulus_or_condition=stimulus_or_condition,
+                    response=response, nfr_category=nfr_category,
+                    verification_method=verification_method,
+                    acceptance_measure=acceptance_measure, status=status,
+                )
+        except sqlite3.IntegrityError as e:
+            raise RepositoryError(f"Cannot add requirement {requirement_id!r}: {e}") from e
+        return requirement_id
+
+    def add_requirements_with_sequential_ids(
+        self, rows: Sequence[dict[str, Any]], *, prefix: str, width: int = 4
+    ) -> list[str]:
+        """Insert several requirements in ONE transaction, assigning ids
+        <prefix><n> (zero-padded to `width`) after the highest existing one.
+
+        Each row holds add_requirement() keyword arguments (type, statement,
+        priority, evidence, ...); a row's own `requirement_id` is not allowed.
+        Either every row is stored or none is. Returns the new ids in order.
+        """
+        if any("requirement_id" in row for row in rows):
+            raise RepositoryError("Rows must not carry requirement_id; ids are assigned here")
+        new_ids: list[str] = []
+        try:
+            with self.conn:
+                existing = self.conn.execute(
+                    "SELECT id FROM requirements WHERE substr(id, 1, ?) = ?",
+                    (len(prefix), prefix),
+                ).fetchall()
+                numbers = [int(r[0][len(prefix):]) for r in existing if r[0][len(prefix):].isdigit()]
+                next_number = max(numbers, default=0) + 1
+                for offset, row in enumerate(rows):
+                    requirement_id = f"{prefix}{next_number + offset:0{width}d}"
+                    row = dict(row)
+                    self._insert_requirement(
+                        requirement_id, row.pop("type"), row.pop("statement"), **row
+                    )
+                    new_ids.append(requirement_id)
+        except sqlite3.IntegrityError as e:
+            raise RepositoryError(f"Cannot add requirements (nothing was saved): {e}") from e
+        return new_ids
+
+    def _insert_requirement(
+        self,
+        requirement_id: str,
+        type: str,
+        statement: str,
+        *,
+        priority: str,
+        evidence: Sequence[dict[str, Any] | str] = (),
+        feature: str | None = None,
+        stimulus_or_condition: str | None = None,
+        response: str | None = None,
+        nfr_category: str | None = None,
+        verification_method: str | None = None,
+        acceptance_measure: str | None = None,
+        status: str = "pending",
+    ) -> None:
+        """INSERT one requirement + its evidence. Must run inside the caller's transaction."""
         self._check_status(status)
         evidence_list = self._normalize_evidence(evidence)
-        requirement_id = requirement_id or _new_id()
         values = {
             "id": requirement_id,
             "type": type,
@@ -281,16 +343,11 @@ class SQLiteRepository:
         }
         columns = ", ".join(values)
         placeholders = ", ".join("?" * len(values))
-        try:
-            with self.conn:
-                self.conn.execute(
-                    f"INSERT INTO requirements ({columns}) VALUES ({placeholders})",
-                    list(values.values()),
-                )
-                self._insert_evidence(requirement_id, evidence_list)
-        except sqlite3.IntegrityError as e:
-            raise RepositoryError(f"Cannot add requirement {requirement_id!r}: {e}") from e
-        return requirement_id
+        self.conn.execute(
+            f"INSERT INTO requirements ({columns}) VALUES ({placeholders})",
+            list(values.values()),
+        )
+        self._insert_evidence(requirement_id, evidence_list)
 
     def update_requirement(
         self,
