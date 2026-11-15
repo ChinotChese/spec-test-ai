@@ -62,7 +62,14 @@ class SQLiteRepository:
     # ------------------------------------------------------------------ setup
 
     def init_schema(self) -> None:
-        self.conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        try:
+            self.conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        except sqlite3.OperationalError as e:
+            self.conn.close()  # release the file lock (Windows) so it can be reset
+            raise RepositoryError(
+                f"{self.db_path} does not match schema.sql ({e}). "
+                "Check it with: python -m database.init_db"
+            ) from e
         self.conn.commit()
 
     def close(self) -> None:
@@ -93,6 +100,41 @@ class SQLiteRepository:
                 "INSERT INTO documents (id, filename, file_hash, file_path) VALUES (?, ?, ?, ?)",
                 (document_id, filename, file_hash, file_path),
             )
+        return document_id
+
+    def save_document_with_passages(
+        self,
+        document_id: str,
+        filename: str,
+        file_hash: str,
+        file_path: str,
+        passages: Sequence[tuple[str, int | None, str]],
+    ) -> str:
+        """Insert a document and its (passage_id, page, text) rows in one transaction.
+
+        If a document with this file_hash already exists, its id is reused and
+        the passages are attached to it. Either everything is written or nothing.
+        Returns the document id.
+        """
+        try:
+            with self.conn:
+                existing = self.conn.execute(
+                    "SELECT id FROM documents WHERE file_hash = ?", (file_hash,)
+                ).fetchone()
+                if existing is not None:
+                    document_id = existing["id"]
+                else:
+                    self.conn.execute(
+                        "INSERT INTO documents (id, filename, file_hash, file_path) "
+                        "VALUES (?, ?, ?, ?)",
+                        (document_id, filename, file_hash, file_path),
+                    )
+                self.conn.executemany(
+                    "INSERT INTO source_passages (id, document_id, page, text) VALUES (?, ?, ?, ?)",
+                    [(pid, document_id, page, text) for pid, page, text in passages],
+                )
+        except sqlite3.IntegrityError as e:
+            raise RepositoryError(f"Cannot save document {filename!r}: {e}") from e
         return document_id
 
     def get_document(self, document_id: str) -> dict[str, Any] | None:

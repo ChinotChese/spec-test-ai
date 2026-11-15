@@ -307,6 +307,7 @@ Mọi lỗi vi phạm quy tắc đều raise `RepositoryError`.
 | Hàm | Mô tả |
 |---|---|
 | `add_document(filename, file_hash, file_path, document_id=None) -> str` | Thêm document. Nếu `file_hash` đã tồn tại thì trả về id cũ, không thêm mới |
+| `save_document_with_passages(document_id, filename, file_hash, file_path, passages) -> str` | Lưu document cùng các passage `[(passage_id, page, text), ...]` **trong một transaction**: lỗi thì không ghi gì cả. Nếu `file_hash` đã tồn tại thì dùng lại id cũ và gắn passage vào đó. Được `services/document_loader.py` sử dụng |
 | `get_document(document_id)` | Lấy document theo id. Trả `None` nếu không có |
 | `get_document_by_hash(file_hash)` | Lấy document theo hash. Trả `None` nếu không có |
 | `list_documents()` | Danh sách document, sắp theo thời gian tạo |
@@ -383,6 +384,14 @@ with SQLiteRepository("output/spectest.db") as repo:
 
 ## 7. Lưu ý vận hành
 
+- **Vị trí file:** `src/data/spectest.db` (`config.DB_PATH`). Có thể đổi bằng biến môi trường `SPECTEST_DB_PATH` hoặc `SPECTEST_DATA_DIR`. Thư mục `src/data/` và mọi file `*.db` đã được thêm vào `.gitignore` vì DB chứa nguyên văn tài liệu đầu vào. `src/output/` chỉ dành cho file SRS xuất ra.
+- **Khởi tạo và kiểm tra** (chạy từ `src/`):
+  ```bash
+  uv run python -m database.init_db            # tạo nếu chưa có, kiểm tra schema, in số dòng mỗi bảng
+  uv run python -m database.init_db --reset    # XÓA file DB và tạo lại (mất toàn bộ dữ liệu)
+  uv run python -m database.init_db --db PATH  # dùng file khác
+  ```
+  Mở `SQLiteRepository(path)` cũng tự tạo DB và các bảng còn thiếu. Tuy nhiên `init_db` kiểm tra thêm DB hiện có còn khớp với `schema.sql` không. Nếu lệch, nó trả exit code 1 và liệt kê bảng hoặc cột lệch. Mở một DB lệch bằng `SQLiteRepository` sẽ báo `RepositoryError` kèm hướng dẫn này.
 - **Đổi schema:** chưa có cơ chế migration. `CREATE TABLE IF NOT EXISTS` không sửa bảng đã tồn tại. Khi đổi schema, cần xóa file `.db` cũ hoặc tự viết script migration. Một file `.db` tạo từ bản schema cũ sẽ không tương thích với bản này. Bản cũ là bản còn cột `evidence_json` / `requirement_ids_json`, hoặc bản mà bảng `requirements` chưa có 7 cột `priority` … `acceptance_measure`.
 - **Một connection, một luồng:** mỗi `SQLiteRepository` giữ một `sqlite3.Connection`. Mặc định Python không cho dùng chung connection này giữa các thread, nên mỗi thread nên tạo repository riêng.
 - **Yêu cầu SQLite có JSON1:** cột `srs_json` dùng `json_valid`. JSON1 được tích hợp sẵn từ SQLite 3.38. Kiểm tra phiên bản bằng `python -c "import sqlite3; print(sqlite3.sqlite_version)"`.
