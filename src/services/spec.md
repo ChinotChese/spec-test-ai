@@ -283,7 +283,7 @@ Chỉ có **một** định nghĩa, dùng chung cho cả `validate()`, `save_can
 3. có `quote` (quote thiếu, hoặc chỉ gồm khoảng trắng/dấu câu, thì không kiểm chứng được nên không hợp lệ);
 4. quote **nằm trong chính passage được trích**.
 
-Quote được so khớp sau khi chuẩn hóa bằng đúng hàm `_normalize` của `document_loader` (NFKC, casefold, chỉ giữ chữ và số). Vì vậy khác biệt về khoảng trắng, dấu câu, gạch nối hay chữ hoa thường được bỏ qua, nhưng chữ bị đổi hoặc bịa thêm thì không qua.
+Quy tắc nằm ở [database/evidence_rules.py](../database/evidence_rules.py) và được dùng chung với repository, nên kiểm tra trước khi lưu và kiểm tra lúc approve không bao giờ lệch nhau. Quote được so khớp sau khi chuẩn hóa bằng `normalize_for_match` (NFKC, casefold, chỉ giữ chữ và số). Loader cũng dùng đúng hàm này để kiểm tra passage. Vì vậy khác biệt về khoảng trắng, dấu câu, gạch nối hay chữ hoa thường được bỏ qua, nhưng chữ bị đổi hoặc bịa thêm thì không qua.
 
 **Một evidence item sai làm cả requirement không hợp lệ.** Requirement không bị cắt bớt cho còn các item hợp lệ, vì khi đó statement sẽ khẳng định nhiều hơn những gì evidence còn lại chứng minh. Đây là cùng nguyên tắc extractor áp dụng với passage id lạ.
 
@@ -322,8 +322,8 @@ Lưu requirement chờ duyệt, cấp id, và chặn approve khi evidence không
 
 - **Không có đường nào tự động approve.** `save_candidates()` luôn lưu `status = "pending"`, kể cả khi đầu vào ghi `"approved"`.
 - **Chỉ `approve(id)` chuyển sang `approved`**, và nó **kiểm tra lại evidence đang lưu trong DB** ngay lúc approve (mục 2.1). Evidence không hợp lệ thì raise `RegistryError`, status giữ nguyên.
-- **`get_approved()` kiểm tra lại lần nữa** trước khi giao cho SRS generator. Lý do: một requirement vẫn có thể thành `approved` mà không qua `approve()`, ví dụ do gọi thẳng `repo.set_requirement_status()` hoặc sửa evidence sau khi đã approve. Khi đó `get_approved()` raise `RegistryError` liệt kê các requirement có vấn đề, thay vì âm thầm sinh SRS từ chúng.
-- **`repo.set_requirement_status()` vẫn đổi được status mà không qua kiểm tra** (tầng database không biết về quote). Lỗ hổng này được `get_approved()` bắt lại, nhưng không bị chặn ngay tại repository.
+- **Repository cũng chặn.** Ngay ở `SQLiteRepository`, mọi đường dẫn tới `approved` đều bị chặn khi evidence không hợp lệ: `set_requirement_status`, thêm requirement với status `approved`, và sửa evidence của requirement đã approve. Cả hai tầng dùng chung một quy tắc trong `database/evidence_rules.py` ([database/spec.md](../database/spec.md) mục 3.3). Gọi thẳng repository cũng không lách được.
+- **`get_approved()` kiểm tra lại lần cuối** trước khi giao cho SRS generator, để bắt hai trường hợp repository không chặn được: ghi thẳng bằng SQL, và sửa text của passage ngoài repository. Khi đó nó raise `RegistryError` liệt kê các requirement có vấn đề, thay vì âm thầm sinh SRS từ chúng.
 
 ### 3.2 Id
 
@@ -397,7 +397,8 @@ Chạy trên DB in-memory, các trường hợp đã kiểm tra:
 - **Evidence:** quote bịa, quote lấy từ passage khác, thiếu quote, quote chỉ gồm dấu câu, passage không tồn tại, và requirement có evidence lẫn lộn đều bị loại; quote chỉ khác hoa thường hay dấu câu vẫn hợp lệ.
 - **Lưu:** lô có evidence không hợp lệ không lưu gì; trùng trong cùng lô và trùng với dữ liệu đã có đều bị bỏ qua; status `approved` ở đầu vào bị bỏ qua; id tiếp nối số lớn nhất kể cả khi có khoảng trống; một dòng lỗi giữa lô làm cả lô rollback.
 - **Approve:** requirement hợp lệ được approve; approve bị từ chối khi quote đã lưu bị sửa (status giữ nguyên), khi không có evidence, hoặc khi id không tồn tại; requirement đã reject vẫn approve lại được.
-- **`get_approved()`** từ chối requirement được set `approved` qua repository mà evidence không hợp lệ.
+- **Repository** từ chối `set_requirement_status("approved")`, `add_requirement(status="approved")` và lô có dòng `approved` khi evidence không hợp lệ (không ghi gì), từ chối sửa evidence làm hỏng một requirement đã approve (giữ evidence cũ), nhưng cho phép sửa hợp lệ.
+- **`get_approved()`** từ chối requirement có status `approved` (được set bằng SQL thô) mà evidence không hợp lệ.
 - **Dòng hỏng** (không có evidence) vẫn liệt kê, xem và reject được.
 
 ---

@@ -30,9 +30,9 @@ from typing import Any
 from pydantic import BaseModel
 
 import config
+from database import evidence_rules
 from database.sqlite_repository import SQLiteRepository
 from schemas.requirement import RequirementDraft
-from services.document_loader import _normalize  # same rule the loader verifies passages with
 
 logger = logging.getLogger(__name__)
 
@@ -93,19 +93,9 @@ def evidence_problems(
 
 
 def _problems(evidence: list[Any], passages: dict[str, str]) -> list[str]:
-    items = [_as_dict(e) for e in evidence]
-    if not items:
-        return ["no evidence"]
-    problems = []
-    for item in items:
-        pid, quote = item.get("passage_id"), item.get("quote")
-        if pid not in passages:
-            problems.append(f"{pid}: passage not found")
-        elif not quote or not _normalize(quote):
-            problems.append(f"{pid}: no quote to verify")
-        elif _normalize(quote) not in _normalize(passages[pid]):
-            problems.append(f"{pid}: quote not found in passage: {quote[:80]!r}")
-    return problems
+    # The rule itself lives in database.evidence_rules, so the repository's
+    # approval check and this pre-save check can never disagree.
+    return evidence_rules.evidence_problems([_as_dict(e) for e in evidence], passages)
 
 
 # ------------------------------------------------------------------ helpers

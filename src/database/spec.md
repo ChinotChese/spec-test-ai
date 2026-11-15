@@ -6,6 +6,8 @@
 |---|---|
 | [schema.sql](schema.sql) | Định nghĩa bảng, khóa ngoại, ràng buộc, index |
 | [sqlite_repository.py](sqlite_repository.py) | Class `SQLiteRepository`: toàn bộ thao tác đọc/ghi |
+| [evidence_rules.py](evidence_rules.py) | Định nghĩa **duy nhất** của "evidence hợp lệ" và hàm chuẩn hóa text `normalize_for_match`, dùng chung cho repository, `services/evidence_validator.py` và `services/document_loader.py` |
+| [init_db.py](init_db.py) | Lệnh tạo và kiểm tra DB (mục 7) |
 
 Model Pydantic tương ứng được mô tả trong [schemas/spec.md](../schemas/spec.md).
 
@@ -214,6 +216,7 @@ Khóa chính là `(srs_run_id, requirement_id)`. Cặp `(srs_run_id, position)` 
 | `page >= 1`, `srs_json` là JSON hợp lệ | ✔ | |
 | Mỗi file (theo `file_hash`) chỉ được lưu một lần | ✔ (UNIQUE) | ✔ (trả lại id của document đã có) |
 | **SRS run chỉ chứa requirement đã `approved`** | | ✔ (khóa ngoại không diễn tả được điều kiện này) |
+| **Requirement `approved` phải có evidence hợp lệ** (mục 3.3) | | ✔ (kiểm tra trong cùng transaction với thao tác ghi) |
 | Một passage không được liệt kê hai lần trong evidence của một requirement | ✔ (PK) | ✔ |
 
 > **Bắt buộc:** SQLite chỉ kiểm tra khóa ngoại khi mỗi connection bật `PRAGMA foreign_keys = ON`. `SQLiteRepository` tự bật khi khởi tạo. Nếu bạn mở database bằng một công cụ khác (DB Browser, sqlite3 CLI…) thì phải tự bật lệnh này.
@@ -230,7 +233,21 @@ stateDiagram-v2
     approved --> [*] : được đưa vào SRS run
 ```
 
-Database không giới hạn hướng chuyển trạng thái: có thể chuyển giữa 3 trạng thái theo bất kỳ chiều nào. Ràng buộc cứng duy nhất là `add_srs_run()` từ chối requirement chưa `approved`, trừ khi gọi với `require_approved=False`.
+Có thể chuyển giữa 3 trạng thái theo bất kỳ chiều nào, với **một điều kiện cho `approved`**: requirement phải có evidence hợp lệ theo [evidence_rules.py](evidence_rules.py). Nghĩa là có ít nhất 1 evidence, và mọi evidence item đều trỏ tới passage có thật, có quote, và quote nằm trong chính passage đó (sau chuẩn hóa).
+
+Repository kiểm tra điều kiện này **trong cùng transaction** ở mọi đường có thể dẫn tới `approved`. Nếu không đạt, nó raise `RepositoryError` và **không ghi gì**:
+
+| Thao tác | Khi nào bị chặn |
+|---|---|
+| `set_requirement_status(id, "approved")` | Evidence đang lưu không hợp lệ; status giữ nguyên |
+| `add_requirement(..., status="approved")` / `add_requirements_with_sequential_ids` với dòng `approved` | Evidence của dòng đó không hợp lệ; cả thao tác (cả lô) rollback |
+| `update_requirement(id, evidence=…)` trên requirement **đang `approved`** | Evidence mới không hợp lệ; evidence cũ được giữ |
+
+Requirement `pending` hoặc `rejected` **được phép** có evidence không hợp lệ; nó chỉ không thể chuyển sang `approved`.
+
+Còn hai cách lách mà repository không chặn được: ghi thẳng bằng SQL, và sửa text của passage ngoài repository. `services/requirement_registry.get_approved()` kiểm tra lại evidence lần cuối để bắt các trường hợp này.
+
+Ràng buộc còn lại: `add_srs_run()` từ chối requirement chưa `approved`, trừ khi gọi với `require_approved=False`.
 
 ### 3.4 Giao dịch (transaction)
 
@@ -329,8 +346,9 @@ Mọi lỗi vi phạm quy tắc đều raise `RepositoryError`.
 |---|---|
 | `add_requirement(type, statement, *, priority, evidence=(), feature=None, stimulus_or_condition=None, response=None, nfr_category=None, verification_method=None, acceptance_measure=None, status="pending", requirement_id=None) -> str` | Thêm requirement. Tên tham số trùng với field của `RequirementDraft`, nên có thể gọi `repo.add_requirement(**draft.model_dump())`. Mỗi phần tử của `evidence` là một chuỗi `passage_id` hoặc một dict `{"passage_id", "quote"}` |
 | `add_requirements_with_sequential_ids(rows, *, prefix, width=4) -> list[str]` | Lưu nhiều requirement **trong một transaction**, cấp id `<prefix><số>` tiếp nối số lớn nhất đang có với cùng prefix (ví dụ `RQ-0040`). Mỗi phần tử của `rows` là dict tham số giống `add_requirement` và không được chứa `requirement_id`. Một dòng lỗi thì không lưu dòng nào. Được `services/requirement_registry.py` sử dụng |
-| `update_requirement(id, *, evidence=None, **fields)` | Sửa các field nội dung (`type`, `statement`, `priority`, `feature`, `stimulus_or_condition`, `response`, `nfr_category`, `verification_method`, `acceptance_measure`). Truyền `None` để xóa giá trị một field. Nếu truyền `evidence` thì danh sách evidence cũ bị **thay toàn bộ**. Đổi `status` phải dùng `set_requirement_status()` |
-| `set_requirement_status(id, status)` | Đổi trạng thái |
+| `update_requirement(id, *, evidence=None, **fields)` | Sửa các field nội dung (`type`, `statement`, `priority`, `feature`, `stimulus_or_condition`, `response`, `nfr_category`, `verification_method`, `acceptance_measure`). Truyền `None` để xóa giá trị một field. Nếu truyền `evidence` thì danh sách evidence cũ bị **thay toàn bộ**. Đổi `status` phải dùng `set_requirement_status()`. Trên requirement đang `approved`, thay đổi làm evidence không hợp lệ bị từ chối và không ghi gì |
+| `set_requirement_status(id, status)` | Đổi trạng thái. `"approved"` bị từ chối (`RepositoryError`, status giữ nguyên) nếu evidence không hợp lệ (mục 3.3) |
+| `approval_problems(id) -> list[str]` | Lý do evidence đang lưu không hợp lệ; danh sách rỗng là approve được. Chỉ đọc |
 | `get_requirement(id)` | Lấy requirement kèm `evidence` |
 | `list_requirements(status=None, *, type=None, feature=None, nfr_category=None)` | Danh sách requirement. Các bộ lọc được kết hợp bằng AND |
 | `get_approved_requirements()` | Viết tắt của `list_requirements("approved")` |

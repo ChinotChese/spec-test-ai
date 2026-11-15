@@ -31,7 +31,6 @@ import hashlib
 import io
 import logging
 import sys
-import unicodedata
 import zipfile
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -42,6 +41,7 @@ from xml.etree import ElementTree
 from pydantic import BaseModel, ValidationError
 
 import config
+from database.evidence_rules import normalize_for_match
 from database.sqlite_repository import SQLiteRepository
 from llm_clients import gemini_client
 
@@ -333,11 +333,8 @@ def _call_gemini(client: Any, model: str, contents: list[Any], name: str) -> Par
 # ------------------------------------------------------------ verification
 
 
-def _normalize(text: str) -> str:
-    """Letters and digits only, case-folded: ignores whitespace, punctuation,
-    bullets, and hyphenation differences between the model and the source."""
-    text = unicodedata.normalize("NFKC", text).casefold()
-    return "".join(ch for ch in text if ch.isalnum())
+# Same normalization the evidence check uses (database.evidence_rules).
+_normalize = normalize_for_match
 
 
 def _clean(text: str) -> str:

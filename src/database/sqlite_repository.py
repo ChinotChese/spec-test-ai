@@ -23,6 +23,8 @@ from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
+from database.evidence_rules import evidence_problems
+
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 REQUIREMENT_STATUSES = ("pending", "approved", "rejected")
@@ -348,6 +350,8 @@ class SQLiteRepository:
             list(values.values()),
         )
         self._insert_evidence(requirement_id, evidence_list)
+        if status == "approved":
+            self._assert_approvable(requirement_id)
 
     def update_requirement(
         self,
@@ -362,6 +366,8 @@ class SQLiteRepository:
         response, nfr_category, verification_method, acceptance_measure.
         Pass a field as None to clear it (e.g. stimulus_or_condition=None).
         Use set_requirement_status() to change the review status.
+        On an approved requirement, the change is refused (nothing stored) if it
+        would leave the evidence invalid.
         """
         unknown = set(fields) - _REQUIREMENT_CONTENT_FIELDS
         if unknown:
@@ -386,18 +392,54 @@ class SQLiteRepository:
                         (requirement_id,),
                     )
                     self._insert_evidence(requirement_id, evidence_list)
+                status = self.conn.execute(
+                    "SELECT status FROM requirements WHERE id = ?", (requirement_id,)
+                ).fetchone()[0]
+                if status == "approved":
+                    self._assert_approvable(
+                        requirement_id, "be changed this way while approved (nothing was changed)"
+                    )
         except sqlite3.IntegrityError as e:
             raise RepositoryError(f"Cannot update requirement {requirement_id!r}: {e}") from e
 
     def set_requirement_status(self, requirement_id: str, status: str) -> None:
+        """Change the review status.
+
+        "approved" is refused (status unchanged) unless the requirement's stored
+        evidence is valid (database.evidence_rules), checked in the same
+        transaction as the update.
+        """
         self._check_status(status)
         with self.conn:
             cur = self.conn.execute(
                 f"UPDATE requirements SET status = ?, updated_at = {_NOW} WHERE id = ?",
                 (status, requirement_id),
             )
-        if cur.rowcount == 0:
-            raise RepositoryError(f"Requirement {requirement_id!r} not found")
+            if cur.rowcount == 0:
+                raise RepositoryError(f"Requirement {requirement_id!r} not found")
+            if status == "approved":
+                self._assert_approvable(requirement_id)
+
+    def approval_problems(self, requirement_id: str) -> list[str]:
+        """Why the requirement's stored evidence is not valid; [] means approvable."""
+        evidence = [
+            dict(r)
+            for r in self.conn.execute(
+                "SELECT passage_id, quote FROM requirement_evidence "
+                "WHERE requirement_id = ? ORDER BY rowid",
+                (requirement_id,),
+            )
+        ]
+        texts = {p["id"]: p["text"] for p in self.get_passages([e["passage_id"] for e in evidence])}
+        return evidence_problems(evidence, texts)
+
+    def _assert_approvable(self, requirement_id: str, action: str = "be approved") -> None:
+        """Raise inside the caller's transaction so the change is rolled back."""
+        problems = self.approval_problems(requirement_id)
+        if problems:
+            raise RepositoryError(
+                f"{requirement_id} cannot {action}, invalid evidence: {'; '.join(problems)}"
+            )
 
     def get_requirement(self, requirement_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(

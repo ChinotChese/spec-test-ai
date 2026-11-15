@@ -6,9 +6,12 @@
 
 Approval rule: a requirement is approved ONLY by an explicit approve() call,
 and approve() refuses unless its stored evidence is valid at that moment
-(services.evidence_validator: every cited passage exists and every quote is
+(database.evidence_rules: every cited passage exists and every quote is
 found in its passage). Nothing in this module approves automatically:
 save_candidates() always stores "pending", whatever the input says.
+The repository enforces the same rule on every path to "approved"
+(set_requirement_status, add with status "approved", evidence edits on an
+approved requirement), so it cannot be bypassed through the repository API.
 
 Ids: "RQ-" + 4 digits, sequential after the highest existing RQ number,
 assigned in the same transaction as the inserts. They are storage ids, not the
@@ -30,7 +33,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from database.sqlite_repository import SQLiteRepository
+from database.sqlite_repository import RepositoryError, SQLiteRepository
 from schemas.requirement import Requirement, RequirementDraft
 from services import evidence_validator
 
@@ -111,7 +114,10 @@ def approve(requirement_id: str, *, repo: SQLiteRepository | None = None) -> Req
             raise RegistryError(
                 f"{requirement_id} cannot be approved, invalid evidence: {'; '.join(problems)}"
             )
-        r.set_requirement_status(requirement_id, "approved")
+        try:
+            r.set_requirement_status(requirement_id, "approved")  # re-checks in its transaction
+        except RepositoryError as e:
+            raise RegistryError(str(e)) from e
         return Requirement.model_validate(r.get_requirement(requirement_id))
 
 
@@ -145,10 +151,11 @@ def list_by_status(
 def get_approved(*, repo: SQLiteRepository | None = None) -> list[Requirement]:
     """Approved requirements for the SRS (app.py step 5).
 
-    Evidence is re-checked: a requirement can reach "approved" without
-    approve() (e.g. repo.set_requirement_status, or evidence edited after
-    approval). If any approved requirement has invalid evidence, RegistryError
-    is raised instead of silently building an SRS on it.
+    Evidence is re-checked as a last line of defence: the repository blocks
+    every API path to an approved requirement with invalid evidence, but raw
+    SQL (or a passage text changed outside the repository) can still produce
+    one. If any approved requirement has invalid evidence, RegistryError is
+    raised instead of silently building an SRS on it.
     """
     with _repo(repo) as r:
         rows = r.get_approved_requirements()
