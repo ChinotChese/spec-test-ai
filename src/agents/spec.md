@@ -28,8 +28,8 @@ Các module liên quan:
 flowchart TD
     A["passages<br/>(repo.list_passages)"] --> B[Gom theo document_id]
     B --> C["Mỗi tài liệu: 1 lần gọi Gemini<br/>structured output"]
-    C --> D{"finish_reason = STOP<br/>và có list requirements?"}
-    D -- không --> X[ExtractionError]
+    C --> D{"Gọi thành công, finish_reason = STOP<br/>và có list requirements?"}
+    D -- không --> X["Bỏ qua tài liệu<br/>report.error, xử lý tiếp tài liệu sau"]
     D -- có --> E[Kiểm tra từng item]
     E --> F{"Hợp lệ RequirementDraft?<br/>Passage id thuộc tài liệu này?<br/>Không trùng?"}
     F -- có --> G[requirements]
@@ -140,9 +140,9 @@ from agents import requirement_extractor
 
 | Hàm | Mô tả |
 |---|---|
-| `extract(passages, *, client=None, model=None) -> list[RequirementDraft]` | Requirement hợp lệ của mọi tài liệu, theo thứ tự tài liệu rồi theo thứ tự model trả về. Đây là hàm `app.py` gọi |
-| `extract_with_report(passages, *, client=None, model=None) -> list[ExtractionReport]` | Như trên, kèm báo cáo cho từng tài liệu, và ghi log |
-| `extract_document(document_id, passages, *, client=None, model=None) -> ExtractionReport` | Một tài liệu, một lần gọi |
+| `extract(passages, *, client=None, model=None) -> list[RequirementDraft]` | Requirement hợp lệ của các tài liệu xử lý thành công, theo thứ tự tài liệu rồi theo thứ tự model trả về. Tài liệu lỗi bị bỏ qua (mục "Lỗi" bên dưới). Đây là hàm `app.py` gọi |
+| `extract_with_report(passages, *, client=None, model=None) -> list[ExtractionReport]` | Như trên, kèm báo cáo cho **mọi** tài liệu, kể cả tài liệu lỗi, và ghi log |
+| `extract_document(document_id, passages, *, client=None, model=None) -> ExtractionReport` | Một tài liệu, một lần gọi. Lỗi thì raise `ExtractionError`, không bỏ qua |
 
 - `passages` là các dict có ít nhất `id`, `document_id` và `text` (`page` tùy chọn), đúng dạng `repo.list_passages()` và `document_loader.ingest()` trả về.
 - `client`: mặc định tạo `genai.Client` từ `config.GEMINI_API_KEY`, và tạo **một lần** cho mọi tài liệu. Có thể truyền client giả khi test.
@@ -156,18 +156,33 @@ from agents import requirement_extractor
 | `passage_count` | Số passage đã gửi |
 | `requirements` | `list[RequirementDraft]` hợp lệ |
 | `rejected` | `list[Rejected]`; mỗi phần tử có `item` (item gốc model trả về) và `reason` |
+| `error` | `None` nếu thành công; thông báo lỗi nếu tài liệu bị bỏ qua |
+| `failed` | `True` khi `error` khác `None` |
 | `functional` / `nonfunctional` | Lọc `requirements` theo loại |
 
-**Lỗi**
+**Lỗi của một tài liệu.** Mọi lỗi khi xử lý một tài liệu đều được quy về `ExtractionError`:
 
-| Tình huống | Lỗi |
+| Tình huống | Thông báo (ví dụ) |
 |---|---|
-| Thiếu `GEMINI_API_KEY` hoặc chưa cài `google-genai` | `ExtractionError` |
-| Hết quota ngày, 429 lặp lại, response bị cắt (`MAX_TOKENS`…), không có candidate | `ExtractionError` (bọc `GeminiError`) |
-| Response không phải JSON / không có list `requirements` | `ExtractionError` |
-| HTTP 400 / 401 / 403 / 404 (ví dụ sai tên model) | `google.genai.errors.APIError`, **không** được bọc |
+| Hết quota ngày, 429 lặp lại, response bị cắt (`MAX_TOKENS`…), không có candidate | `DOC-…: Gemini daily quota exhausted (…)` / `… stopped early (finish_reason=MAX_TOKENS)` |
+| HTTP 400 / 401 / 403 / 404 mà SDK không retry (ví dụ sai tên model) | `DOC-…: Gemini HTTP 404 NOT_FOUND: models/x is not found` |
+| Response không phải JSON / không có list `requirements` | `DOC-…: Gemini response is not JSON …` / `… has no "requirements" list` |
 
-Một tài liệu lỗi làm `extract()` / `extract_with_report()` **dừng ngay**. Requirement của các tài liệu đã xử lý trước đó không được trả về. Extractor không lưu gì, nên khi chạy lại, mọi tài liệu sẽ được gọi lại từ đầu.
+**Bỏ qua tài liệu lỗi.** Trong `extract()` / `extract_with_report()`, tài liệu lỗi **bị bỏ qua** và các tài liệu còn lại vẫn được xử lý:
+
+- Báo cáo của tài liệu lỗi có `error` là thông báo lỗi và `requirements` rỗng. Lỗi được ghi log ở mức `ERROR`: `DOC-…: skipped, …`.
+- `extract()` chỉ trả requirement của các tài liệu thành công. Người gọi cần biết tài liệu nào lỗi thì dùng `extract_with_report()` và đọc `failed`/`error`.
+
+**Khi nào vẫn raise `ExtractionError`:**
+
+| Tình huống | Lý do |
+|---|---|
+| Không tạo được client (thiếu `GEMINI_API_KEY`, chưa cài `google-genai`) | Không tài liệu nào xử lý được |
+| **Mọi** tài liệu đều lỗi: `All N document(s) failed; first error: …` | Để hết quota hay sai tên model không bị hiểu nhầm thành "tài liệu không có requirement nào" |
+
+Lỗi không đến từ Gemini, tức lỗi lập trình (ví dụ `RuntimeError`), **không** bị bỏ qua mà được ném ra nguyên dạng.
+
+Extractor không lưu gì, nên muốn xử lý lại tài liệu lỗi thì gọi lại với passage của tài liệu đó, ví dụ `python -m agents.requirement_extractor DOC-…`.
 
 ### 1.7 Cấu hình
 
@@ -193,7 +208,13 @@ INFO DOC-bd148209ea0b: 133 passages -> 27 requirements (27 FR, 0 NFR), 0 rejecte
     evidence: DOC-bd148209ea0b-P0008, DOC-bd148209ea0b-P0063
 ```
 
-`ExtractionError` in ra `ERROR …` và thoát với exit code 1. Lỗi HTTP không retry được (mục 1.6) in ra traceback.
+Exit code:
+
+| Kết quả | Output | Exit code |
+|---|---|---|
+| Mọi tài liệu thành công | Requirement của mọi tài liệu | 0 |
+| Một số tài liệu lỗi | Requirement của các tài liệu thành công, rồi `ERROR k of N document(s) skipped: DOC-…` | 1 |
+| Mọi tài liệu lỗi, hoặc không tạo được client | `ERROR …` | 1 |
 
 ### 1.9 Kết quả trên dữ liệu thật
 
@@ -234,6 +255,8 @@ Các trường hợp đã kiểm tra:
 - FR, NFR và `wont` được giữ lại.
 - Bị loại: id lạ, id của tài liệu khác, FR thiếu `feature`, NFR thiếu field, evidence rỗng, statement trùng, field lạ, item không phải object.
 - Response bị cắt, không phải JSON, hoặc thiếu list đều báo `ExtractionError`.
+- HTTP 404 (dùng `ClientError` thật của SDK) được bọc thành `ExtractionError`; tài liệu đó bị bỏ qua, tài liệu tiếp theo vẫn được xử lý; `extract()` trả requirement của tài liệu thành công.
+- Mọi tài liệu lỗi thì raise; lỗi lập trình (`RuntimeError`) vẫn được ném ra.
 - Không có passage thì không gọi model; thiếu API key thì báo lỗi.
 - Schema có hai biến thể với field bắt buộc và mô tả.
 

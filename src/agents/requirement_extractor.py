@@ -81,6 +81,18 @@ class RequirementExtraction(BaseModel):
 RESPONSE_SCHEMA: dict[str, Any] = RequirementExtraction.model_json_schema()
 
 
+def _api_error_types() -> tuple[type[BaseException], ...]:
+    """google.genai.errors.APIError if the SDK is installed (it may not be in tests)."""
+    try:
+        from google.genai import errors
+    except ImportError:
+        return ()
+    return (errors.APIError,)
+
+
+_API_ERRORS = _api_error_types()
+
+
 @dataclass
 class Rejected:
     item: Any        # the raw item as returned by the model
@@ -93,6 +105,11 @@ class ExtractionReport:
     passage_count: int
     requirements: list[RequirementDraft] = field(default_factory=list)
     rejected: list[Rejected] = field(default_factory=list)
+    error: str | None = None  # set when the document failed and was skipped
+
+    @property
+    def failed(self) -> bool:
+        return self.error is not None
 
     @property
     def functional(self) -> list[RequirementDraft]:
@@ -109,7 +126,10 @@ class ExtractionReport:
 def extract(
     passages: Iterable[dict[str, Any]], *, client: Any = None, model: str | None = None
 ) -> list[RequirementDraft]:
-    """Valid requirement drafts for all passages (document by document)."""
+    """Valid requirement drafts for all passages (document by document).
+
+    Documents that fail are skipped (logged as errors); see extract_with_report.
+    """
     reports = extract_with_report(passages, client=client, model=model)
     return [r for report in reports for r in report.requirements]
 
@@ -117,6 +137,13 @@ def extract(
 def extract_with_report(
     passages: Iterable[dict[str, Any]], *, client: Any = None, model: str | None = None
 ) -> list[ExtractionReport]:
+    """One report per document, in input order.
+
+    A document that fails (model error, HTTP error, unusable output) is skipped:
+    its report has `error` set and no requirements, and the others continue.
+    Raises ExtractionError only when no client can be created, or when every
+    document failed, so an exhausted quota never looks like "no requirements".
+    """
     by_document: dict[str, list[dict[str, Any]]] = {}
     for p in passages:
         by_document.setdefault(p["document_id"], []).append(p)
@@ -127,9 +154,16 @@ def extract_with_report(
             raise ExtractionError(str(e)) from e
     reports = []
     for document_id, doc_passages in by_document.items():
-        report = extract_document(document_id, doc_passages, client=client, model=model)
+        try:
+            report = extract_document(document_id, doc_passages, client=client, model=model)
+        except ExtractionError as e:
+            report = ExtractionReport(document_id, len(doc_passages), error=str(e))
         _log_report(report)
         reports.append(report)
+    if reports and all(r.failed for r in reports):
+        raise ExtractionError(
+            f"All {len(reports)} document(s) failed; first error: {reports[0].error}"
+        )
     return reports
 
 
@@ -140,7 +174,11 @@ def extract_document(
     client: Any = None,
     model: str | None = None,
 ) -> ExtractionReport:
-    """One model call for the passages of one document."""
+    """One model call for the passages of one document.
+
+    Every failure is raised as ExtractionError, including HTTP errors the SDK
+    does not retry (400 bad request, 401/403 key or permission, 404 model).
+    """
     try:
         text = gemini_client.generate_json(
             client,
@@ -152,6 +190,9 @@ def extract_document(
         )
     except gemini_client.GeminiError as e:
         raise ExtractionError(str(e)) from e
+    except _API_ERRORS as e:
+        status = f" {e.status}" if e.status else ""
+        raise ExtractionError(f"{document_id}: Gemini HTTP {e.code}{status}: {e.message}") from e
 
     try:
         payload = json.loads(text)
@@ -202,6 +243,9 @@ def _check_item(
 
 
 def _log_report(r: ExtractionReport) -> None:
+    if r.failed:
+        logger.error("%s: skipped, %s", r.document_id, r.error)
+        return
     logger.info(
         "%s: %d passages -> %d requirements (%d FR, %d NFR), %d rejected",
         r.document_id, r.passage_count, len(r.requirements),
@@ -233,7 +277,12 @@ if __name__ == "__main__":
         doc_ids = sys.argv[1:] or [d["id"] for d in repo.list_documents()]
         all_passages = [p for doc_id in doc_ids for p in repo.list_passages(doc_id)]
     try:
-        _print_drafts(extract_with_report(all_passages))
-    except (ExtractionError, gemini_client.GeminiError) as e:
+        reports = extract_with_report(all_passages)
+    except ExtractionError as e:
         logger.error("%s", e)
         sys.exit(1)
+    _print_drafts([r for r in reports if not r.failed])
+    failed = [r.document_id for r in reports if r.failed]
+    if failed:
+        logger.error("%d of %d document(s) skipped: %s", len(failed), len(reports), ", ".join(failed))
+        sys.exit(1)  # partial result printed above; non-zero so scripts notice
