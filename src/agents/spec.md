@@ -5,13 +5,14 @@
 | File | Bước trong `app.py` | Trạng thái |
 |---|---|---|
 | [requirement_extractor.py](requirement_extractor.py) | 2. Trích requirement ứng viên từ passage | ✔ Đã triển khai |
-| [srs_generator.py](srs_generator.py) | 6. Dựng SRS từ requirement đã duyệt | Chưa triển khai (file trống) |
+| [srs_generator.py](srs_generator.py) | 6. Dựng SRS từ requirement đã duyệt | ✔ Đã triển khai |
 
 Các module liên quan:
 
 | Module | Vai trò |
 |---|---|
 | [prompts/requirement_prompt.py](../prompts/requirement_prompt.py) | System prompt và hàm dựng user prompt cho extractor |
+| [prompts/srs_prompt.py](../prompts/srs_prompt.py) | System prompt và hàm dựng user prompt cho generator |
 | [llm_clients/gemini_client.py](../llm_clients/gemini_client.py) | Gọi Gemini, dùng chung với `document_loader`: tạo client, retry, xử lý 429, kiểm tra response bị cắt |
 | [schemas/requirement.py](../schemas/requirement.py) | `RequirementDraft`, là output của extractor ([schemas/spec.md](../schemas/spec.md)) |
 | [database/sqlite_repository.py](../database/sqlite_repository.py) | Nguồn passage khi chạy CLI. Extractor **không ghi** vào DB |
@@ -270,18 +271,142 @@ Các trường hợp đã kiểm tra:
 
 ---
 
-## 2. `srs_generator.py` (chưa triển khai)
+## 2. `srs_generator.py`
 
-Vai trò dự kiến, suy ra từ `app.py`. Phần này **chưa phải đặc tả cuối cùng**.
+Sinh SRS theo IEEE 830 (`schemas.srs.SRS`) từ các requirement **đã approve**, dùng `GEMINI_MODEL_GENERATOR`.
+
+### 2.1 Ai viết phần nào
+
+**Tiêu chí "không có requirement ID mới" được bảo đảm bằng cấu trúc.** Model **không có field nào** để viết statement, priority hay id của requirement. Vì vậy SRS không thể chứa requirement nào ngoài các requirement đã approve trong registry.
+
+| Phần của SRS | Ai viết | Nội dung |
+|---|---|---|
+| Document control, revision history | Code | Tham số `project_name`, `organization`, `prepared_by`, `version`; ngày hôm nay. **Không** do model đoán. Thiếu thì dùng placeholder của template (`<Project Name>`, `<Organization>`, `<Author>`) |
+| Mục lục | Code | `build_toc()` |
+| 1.2 Document Conventions | Code | Văn bản cố định mô tả cách đánh số của chính tài liệu (`DOCUMENT_CONVENTIONS`) |
+| 1.5 References | Code | Mỗi tài liệu nguồn mà evidence trích tới là một reference (`REF-001`…): tên file và đường dẫn |
+| 3.N / 5.N: tên, thứ tự, priority của feature | Code | Gom FR theo `feature` của registry, theo thứ tự đầu vào. Priority ở 5.N.1 là priority cao nhất trong các FR của feature |
+| 5.N.3: functional requirement | Code | `statement` và `priority` **chép nguyên văn** từ registry; id `REQ-N.M` do code đánh số |
+| 6.N: nonfunctional requirement | Code | Chép nguyên văn `statement`, `priority`, `verification_method`, `acceptance_measure`; id `NF-N.M`; nhóm theo `nfr_category` (mục 2.4) |
+| `source_ids` của mọi requirement, sequence, feature | Code | Passage id lấy từ evidence trong registry |
+| 1.1, 1.3, 1.4, 2.1–2.7, 4.1–4.3 (văn xuôi) | Model | Phải trích passage; nguồn không nói đủ thì để `unresolved` |
+| Mô tả feature (dùng cho cả 3.N và 5.N.1) | Model | 1–3 câu dựa trên các FR đã approve |
+| 5.N.2: cặp stimulus/response | Model | Diễn đạt lại một hoặc nhiều FR **của chính feature đó**, liên kết bằng RQ id; id `SR-N.M` do code đánh số |
+
+**Ánh xạ.** Mỗi FR/NFR trong SRS ứng với đúng một requirement đã approve, ghi trong `GenerationReport.requirement_map`, ví dụ `{"REQ-1.1": "RQ-0013", "NF-1.1": "RQ-0040"}`. Schema SRS (`extra="forbid"`, id dạng `REQ-n.m`/`NF-n.m`) không có chỗ cho RQ id, nên bảng ánh xạ được trả riêng.
+
+### 2.2 Đầu vào
+
+`requirements` có thể là `Requirement`, dict từ repository, hoặc chuỗi id. Generator **đọc lại từng id từ registry**, và registry là nguồn chuẩn. Bất kỳ id nào vi phạm một trong các điều sau đều làm generator raise `GenerationError`, không sinh gì:
+
+| Kiểm tra | Thông báo |
+|---|---|
+| Id có trong registry | `RQ-9999: not in the registry` |
+| Status là `approved` | `RQ-0007: status is 'pending', not 'approved'` |
+| Evidence vẫn hợp lệ (`repo.approval_problems`) | `RQ-…: invalid evidence (…)` |
+| Có ít nhất 1 FR (mục 3 và 5 bắt buộc có feature) | `An SRS needs at least one approved functional requirement …` |
+| Danh sách không rỗng | `No requirements given` |
+
+Model nhận: các requirement đã approve, gom theo feature (kèm cặp stimulus/response nếu registry có), các NFR để làm bối cảnh, và **toàn bộ passage của các tài liệu được trích**.
+
+### 2.3 Kiểm tra output của model
+
+Model trả JSON theo schema sinh `SrsDraft`: 13 narrative, cộng `features: [{feature, description, sequences: [{stimulus_or_condition, response, requirement_ids}]}]`. Code không gửi `SRS.model_json_schema()` cho model, vì model không thể tự thỏa mãn các quy tắc về mục lục và đánh số.
+
+| Tình huống | Xử lý |
+|---|---|
+| Narrative `specified` trích passage id không được gửi | Chuyển thành `unresolved`, kèm lý do; ghi warning |
+| Narrative `specified` không trích passage nào | Chuyển thành `unresolved`; ghi warning |
+| Narrative `specified` nhưng không có text | **Lỗi**, gọi lại model |
+| Narrative `unresolved`/`not_applicable` có text | Bỏ text; thiếu reason thì dùng "Not stated in the source documents." |
+| Sequence liên kết id không phải FR của feature đó (id lạ, hoặc FR của feature khác) | Bỏ sequence đó; ghi warning |
+| Feature không có trong danh sách (bịa thêm) | Bỏ qua; ghi warning |
+| Feature bị trả hai lần | Giữ lần đầu; ghi warning |
+| Thiếu feature, feature không có mô tả, hoặc không còn sequence hợp lệ nào | **Lỗi**, gọi lại model |
+| JSON không khớp schema sinh | **Lỗi**, gọi lại model |
+
+Mỗi **lỗi** khiến model được gọi lại **một lần**, kèm danh sách vấn đề trong prompt. Lần thứ hai vẫn lỗi thì raise `GenerationError`. Warning không làm gọi lại. Không trường hợp nào ở trên có thể thêm hay làm rơi requirement.
+
+Sau khi lắp ráp, tài liệu được validate bằng `schemas.srs.SRS` (mọi quy tắc trong [schemas/spec.md](../schemas/spec.md) mục 4.3). Code cũng kiểm tra `requirement_map` là song ánh với danh sách đầu vào, và khớp với `SRS.requirement_ids()`.
+
+### 2.4 Nonfunctional requirement
+
+- **6.1 và 6.2 luôn tồn tại**, tên đúng `Performance` / `Security`. NFR có `nfr_category` khớp **không phân biệt hoa thường** ("performance" → 6.1).
+- **Nhóm không có requirement** có status `unresolved`, reason `No approved performance requirements.` (hoặc `security`).
+- **Category khác** thành 6.3, 6.4… theo thứ tự xuất hiện đầu tiên. Tên hiển thị là cách viết đầu tiên gặp.
+
+### 2.5 Prompt
+
+Prompt nằm ở [prompts/srs_prompt.py](../prompts/srs_prompt.py), viết lại từ `AI-Requirement-Engineering-System/prompts/srs_prompt.py`.
+
+| | Nội dung |
+|---|---|
+| Giữ lại | Vai trò "Senior Requirement Engineer", văn phong tài liệu nghiệp vụ chuyên nghiệp; phần giới thiệu, mục đích, phạm vi, actor nay nằm ở mục 1, 2, 4 của IEEE 830 |
+| Đổi | Model không viết requirement; chỉ viết văn xuôi và các cặp stimulus/response diễn đạt lại requirement có sẵn |
+| Bỏ | "Generate detailed functional requirements", "generate non-functional requirements based on the project context", risks, future enhancements |
+
+Quy tắc chính:
+
+- Chỉ dùng requirement đã approve và passage nguồn.
+- Không thêm requirement, con số, công nghệ, user class hay hệ thống nào.
+- Không viết câu "shall" mới trong văn xuôi.
+- **Không suy diễn quan hệ hay vai trò** mà nguồn không nêu (gọi sản phẩm là "thay thế" công cụ cũ, gọi ai đó là developer…).
+- Không nhắc id `RQ-` trong văn bản.
+- Thà `unresolved` còn hơn bịa.
+
+### 2.6 API
 
 ```python
-srs = srs_generator.generate(requirements=requirements, template=srs_template)
+from agents import srs_generator
 ```
 
-| | Dự kiến |
+| Hàm | Mô tả |
 |---|---|
-| Input | `list[Requirement]` đã `approved` (từ `requirement_registry.get_approved()`), cùng template [templates/standard_srs.yaml](../templates/standard_srs.yaml) |
-| Output | `schemas.srs.SRS`. Mục lục do `build_toc()` sinh, không do model viết |
-| Ánh xạ | FR gom theo `feature` thành mục 3.N/5.N; `stimulus_or_condition`/`response` thành 5.N.2; NFR gom theo `nfr_category` thành 6.N; id `REQ-N.M`/`NF-N.M` đánh số theo vị trí ([schemas/spec.md](../schemas/spec.md) mục 3.5 và 6) |
-| Cần quyết định | `source_ids` trong SRS lấy từ passage id hay document id; mục văn bản tự do (1.x, 2.x, 4.x) do model viết từ passage, hay để `unresolved` |
-| Lưu | `repo.add_srs_run()` ghi lại SRS và danh sách requirement đã dùng |
+| `generate(requirements, template=None, **options) -> SRS` | Như `app.py` gọi (`generate(requirements=..., template=...)`) |
+| `generate_with_report(requirements, *, template=None, project_name=None, organization=None, prepared_by=None, version="1.0", date=None, client=None, model=None, repo=None) -> GenerationReport` | Như trên, kèm báo cáo |
+
+- `template`: dict đã parse từ `templates/standard_srs.yaml` (không bắt buộc). Nếu có, `document_control` của nó được dùng làm giá trị mặc định. Generator không tự đọc YAML, vì `.venv` hiện chưa có PyYAML.
+- `repo`: mặc định mở `config.DB_PATH`. `client`: mặc định tạo Gemini client; có thể truyền client giả khi test.
+
+`GenerationReport`:
+
+| Field | Ý nghĩa |
+|---|---|
+| `srs` | `schemas.srs.SRS` đã validate |
+| `requirement_map` | `{"REQ-1.1": "RQ-0013", …}` |
+| `documents` | Id các tài liệu nguồn được trích |
+| `warnings` | Những gì đã bị bỏ hoặc chuyển thành `unresolved` (mục 2.3) |
+| `attempts` | 1 hoặc 2 |
+
+Lỗi: mọi trường hợp đều là `GenerationError`, gồm lỗi Gemini (quota, response bị cắt, HTTP 4xx…), đầu vào không hợp lệ, và output vẫn sai sau 2 lần gọi. Generator **không lưu** SRS vào `srs_runs`.
+
+### 2.7 Chạy từ dòng lệnh
+
+Chạy từ `src/`. Lệnh dùng **mọi** requirement đang approve (`requirement_registry.get_approved()`):
+
+```bash
+uv run python -m agents.srs_generator --project "AI-Powered Customer Support Platform" \
+    --org ExampleCorp --author "Alice Example" --out output/srs.json
+```
+
+Lệnh in số feature, số requirement, các tài liệu được trích và warning, rồi ghi SRS dạng JSON ra file (hoặc in ra nếu không có `--out`). Lỗi thì exit code 1.
+
+### 2.8 Kết quả trên dữ liệu thật
+
+Chạy trên **bản sao** của DB, với 27 requirement đã approve của tài liệu "AI-Powered Customer Support Platform" (được chọn theo tài liệu mà evidence trích tới):
+
+- **Kết quả:** SRS hợp lệ ngay lần gọi đầu, mất khoảng 35 giây; 7 feature, 27 FR, `REQ-1.1`…`REQ-7.9`; ánh xạ khớp đúng 27 RQ id; 6.1/6.2 `unresolved` (không có NFR được approve).
+- **Lần chạy 1 cho thấy ba lỗi văn xuôi, đã sửa:**
+  - Mục 1.2 ghi sai "requirements are identified using the prefix RQ-" → nay mục này do code viết.
+  - Mục 2.1 suy diễn "replaces the existing HelpdeskTool helpdesk", trong khi khách nói HelpdeskTool "work fine".
+  - Mục 1.3 gán vai trò "developer" và chỉ sai mục chi tiết.
+
+  Hai lỗi sau được sửa bằng quy tắc mới trong prompt; lần chạy 2 không còn lỗi nào trong ba lỗi này.
+- **Sequence:** đọc thủ công, các cặp stimulus/response chỉ diễn đạt lại FR, giữ đúng giá trị cụ thể (mốc 24h/48h), không có hành vi mới.
+
+### 2.9 Giới hạn
+
+- **Cặp stimulus/response và văn xuôi do model viết**, nên vẫn cần người đọc lại trước khi gửi khách. Code chỉ bảo đảm liên kết đúng FR và passage được trích có tồn tại, không bảo đảm câu chữ trung thành với nguồn.
+- **Chưa có khái niệm "dự án".** `get_approved()` trả mọi requirement đã approve. Hiện DB chứa requirement của hai dự án khác nhau (hai email đề xuất). Nếu approve cả hai, lệnh CLI sẽ sinh **một** SRS trộn hai sản phẩm. Cách tạm thời: chỉ approve requirement của một dự án, hoặc gọi `generate()` với danh sách id đã lọc. `GenerationReport.documents` cho biết SRS dựa trên những tài liệu nào.
+- **Model chỉ được gọi lại một lần.** Tài liệu rất lớn (nhiều passage) có thể vượt giới hạn output và gây `MAX_TOKENS`.
+- **Không lưu kết quả.** Lưu vào `srs_runs` (`repo.add_srs_run`) và kiểm tra placeholder `<…>` còn sót thuộc về `srs_validator` / bước export, đều chưa triển khai.

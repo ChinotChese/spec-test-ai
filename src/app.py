@@ -25,8 +25,7 @@ def generate_approved_srs():
     
     # 6. Compose SRS using schema and template
     srs = srs_generator.generate(
-        requirements=requirements,
-        template=srs_template
+        requirements=requirements
     )
     
     # 7. Validate and export

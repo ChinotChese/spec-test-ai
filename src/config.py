@@ -36,6 +36,7 @@ DB_PATH = Path(os.getenv("SPECTEST_DB_PATH", DATA_DIR / "spectest.db"))
 # Gemini. GEMINI_API_KEY is passed to the client explicitly (GOOGLE_API_KEY is not read).
 GEMINI_MODEL_LOADER = os.getenv("GEMINI_MODEL_LOADER", "gemini-3.5-flash-lite")
 GEMINI_MODEL_EXTRACTOR = os.getenv("GEMINI_MODEL_EXTRACTOR", "gemini-3.8-flash")
+GEMINI_MODEL_GENERATOR = os.getenv("GEMINI_MODEL_GENERATOR", "gemini-3.8-flash")
 GEMINI_TIMEOUT_MS = int(os.getenv("GEMINI_TIMEOUT_MS", "300000"))
 # Retries on 408 / 429 / 5xx and transient network errors, exponential backoff.
 GEMINI_RETRY_ATTEMPTS = int(os.getenv("GEMINI_RETRY_ATTEMPTS", "4"))      # total tries, 1 = no retry
