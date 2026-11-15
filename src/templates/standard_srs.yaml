@@ -1,0 +1,199 @@
+# Fill-in IEEE 830 SRS template, adapted from IEEE_830_SRS_Template.md.
+# This is an SRS skeleton, not a completed project specification. Replace every
+# <placeholder>, add provenance source IDs, and generate the TOC before validation.
+# The keys and nesting match contracts.models.SRS; no test artifacts belong here.
+
+# Software Requirements Specification for <Project Name>
+document_control:
+  project_name: "<Project Name>"
+  version: "<Version matching the last revision below>"
+  prepared_by:
+    - "<Author>"
+  organization: "<Organization>"
+  date_created: "0000-00-00" # Replace with an actual YYYY-MM-DD date.
+
+# Compose from the final feature and NFR names using contracts.models.build_toc.
+# Include sections 1–6, all fixed subsections, and each repeated 3.N/5.N/6.N.
+table_of_contents: []
+
+revision_history:
+  - name: "<Your name>"
+    date: "0000-00-00" # Replace with an actual YYYY-MM-DD date.
+    reason_for_changes: "<Initial version or actual reason>"
+    version: "<Version matching the last revision below>" # Must match document_control.version.
+
+# Each narrative starts unresolved: replace status/text/reason and cite source_ids
+# when its content is known. Use not_applicable only with a justified reason.
+introduction: # 1. Introduction
+  purpose: # 1.1. Purpose
+    # Identify the product, release, and scope covered by this specification.
+    status: unresolved
+    text: null
+    reason: "Product identity, release, and scope await project input."
+    source_ids: []
+  document_conventions: # 1.2. Document Conventions
+    # Explain standards/typographical conventions and whether higher-level
+    # requirement priorities are inherited or each statement has its own.
+    status: unresolved
+    text: null
+    reason: "Document conventions await project input."
+    source_ids: []
+  intended_audience_and_reading_suggestions: # 1.3.
+    # Identify readers (developers, managers, users, testers, writers, etc.),
+    # describe the document organization, and suggest reading paths by role.
+    status: unresolved
+    text: null
+    reason: "Audience and reading suggestions await project input."
+    source_ids: []
+  product_scope: # 1.4. Product Scope
+    # Summarize purpose, benefits, objectives, and goals; relate to business
+    # strategy where applicable.
+    status: unresolved
+    text: null
+    reason: "Product scope awaits project input."
+    source_ids: []
+  references: [] # 1.5. References
+  # Add entries with reference_id, title, author, version, date, location,
+  # source_ids. Include the assignment document and enough details to retrieve
+  # every cited standard, contract, style guide, or other source.
+  # Example shape (replace with actual references):
+  # - reference_id: REF-001
+  #   title: "<Title>"
+  #   author: "<Author or null>"
+  #   version: "<Version or null>"
+  #   date: "<Date or null>"
+  #   location: "<URL/path or null>"
+  #   source_ids: ["<Source ID>"]
+
+overall_description: # 2. Overall Description
+  product_perspective: # 2.1.
+    # Explain context and origin: new standalone product, replacement, or
+    # follow-on member of a product family.
+    status: unresolved
+    text: null
+    reason: "Product perspective awaits project input."
+    source_ids: []
+  product_features: # 2.2.
+    # Summarize major features in an accessible overview; section 3 introduces
+    # them and section 5 specifies their requirements in detail.
+    status: unresolved
+    text: null
+    reason: "Product feature summary awaits project input."
+    source_ids: []
+  user_classes_and_characteristics: # 2.3.
+    # Distinguish user classes by function, frequency, expertise, privileges,
+    # or experience; identify which classes matter most and any class-specific needs.
+    status: unresolved
+    text: null
+    reason: "User classes and characteristics await project input."
+    source_ids: []
+  operating_environment: # 2.4.
+    # State hardware, OS and versions, and software with which the product must coexist.
+    status: unresolved
+    text: null
+    reason: "Operating environment awaits project input."
+    source_ids: []
+  design_and_implementation_constraints: # 2.5.
+    # Include applicable policies, hardware limits, interfaces, technology,
+    # databases, protocols, security, language, and coding conventions.
+    status: unresolved
+    text: null
+    reason: "Design and implementation constraints await project input."
+    source_ids: []
+  user_documentation: # 2.6.
+    # List manuals, online help, tutorials, formats, and delivery standards.
+    status: unresolved
+    text: null
+    reason: "User documentation deliverables await project input."
+    source_ids: []
+  assumptions_and_dependencies: # 2.7.
+    # Distinguish assumptions from facts and record external dependencies whose
+    # change could affect requirements (unless already documented elsewhere).
+    status: unresolved
+    text: null
+    reason: "Assumptions and dependencies await project input."
+    source_ids: []
+
+# 3. System Features — one short overview (typically 1–3 sentences) per feature.
+# Keep each feature_id, ordinal, name, and order identical to section 5.
+system_features:
+  - feature_id: "<Feature ID, e.g. FEAT-001>"
+    ordinal: 1
+    name: "<Feature Name>"
+    description: "<Brief description of the feature>"
+    source_ids: ["<Source ID>"]
+  # Repeat as 3.2, 3.3, ... for additional features.
+
+external_interface_requirements: # 4. External Interface Requirements
+  user_interfaces_overview: # 4.1.
+    # Describe user workflows and feedback for each screen, GUI/text interaction,
+    # minimum interface requirements, layouts, style guides, common controls,
+    # keyboard shortcuts, and error-message conventions.
+    status: unresolved
+    text: null
+    reason: "User interface requirements await project input."
+    source_ids: []
+  hardware_interfaces: # 4.2.
+    # Describe physical/logical device interfaces, data/control interactions,
+    # supported devices, and communication protocols.
+    status: unresolved
+    text: null
+    reason: "Hardware interface applicability awaits project input."
+    source_ids: []
+  software_interfaces: # 4.3.
+    # Identify connected software and versions, incoming/outgoing data and
+    # messages, services, shared data, and required communication mechanisms.
+    status: unresolved
+    text: null
+    reason: "Software interface requirements await project input."
+    source_ids: []
+
+# 5. System Features/Modules — detailed functional requirements grouped by
+# feature. Repeat one block for each section 3 feature in exactly the same order.
+system_features_modules:
+  - feature_id: "<Feature ID, e.g. FEAT-001>"
+    ordinal: 1
+    name: "<Feature Name>"
+    description_and_priority: # 5.1.1.
+      description: "<Short feature description>"
+      priority: must # Choose must, should, could, or wont.
+    stimulus_response_sequences: # 5.1.2.
+      - sequence_id: "<Sequence ID, e.g. SR-001>"
+        stimulus_or_condition: "<Stimulus or condition>"
+        response: "<System response>"
+        source_ids: ["<Source ID>"]
+      # Add one entry for each additional stimulus/response pair.
+    functional_requirements: # 5.1.3.
+      - requirement_id: REQ-1.1
+        # One complete, uniquely identified, concise, verifiable shall-statement
+        # per requirement; include invalid inputs and anticipated error conditions.
+        statement: "<Upon an event or condition, the system shall perform an action.>"
+        priority: must
+        stimulus_response_ids: ["<Sequence ID, e.g. SR-001>"]
+        source_ids: ["<Source ID>"]
+      # Add REQ-1.2, etc. Every stimulus/response sequence needs a linked FR;
+      # additional FRs need not refer to a sequence (use an empty list).
+  # Repeat for 5.2, 5.3, ... with REQ-2.1, REQ-3.1, ... respectively.
+
+nonfunctional_requirements: # 6. Nonfunctional Requirements
+  performance: # 6.1.
+    ordinal: 1
+    name: Performance
+    status: unresolved
+    reason: "Performance requirements await project input."
+    requirements: []
+    # On specification, set status: specified and reason: null; add NF-1.1,
+    # NF-1.2, ... with statement, priority, verification_method,
+    # acceptance_measure, and source_ids. Define a measurable performance target.
+  security: # 6.2.
+    ordinal: 2
+    name: Security
+    status: unresolved
+    reason: "Security requirements await project input."
+    requirements: []
+    # As above, add NF-2.1, NF-2.2, ... for security requirements.
+  additional_categories: [] # 6.3, 6.4, ... as needed.
+  # Each additional category has ordinal, name, status, reason, requirements.
+  # Each NFR has requirement_id (NF-<category>.<number>), statement,
+  # priority (must/should/could/wont), verification_method
+  # (test/inspection/analysis/demonstration), acceptance_measure, source_ids.
