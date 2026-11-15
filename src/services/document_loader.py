@@ -30,10 +30,7 @@ from __future__ import annotations
 import hashlib
 import io
 import logging
-import random
-import re
 import sys
-import time
 import unicodedata
 import zipfile
 from collections.abc import Iterable
@@ -46,6 +43,7 @@ from pydantic import BaseModel, ValidationError
 
 import config
 from database.sqlite_repository import SQLiteRepository
+from llm_clients import gemini_client
 
 logger = logging.getLogger(__name__)
 
@@ -314,137 +312,20 @@ def _decode_text(data: bytes, name: str) -> str:
 # ------------------------------------------------------------------- Gemini
 
 
-def _make_client() -> Any:
-    if not config.GEMINI_API_KEY:
-        raise DocumentLoaderError("GEMINI_API_KEY is not set; add it to src/.env")
-    try:
-        from google import genai
-        from google.genai import types
-    except ImportError as e:
-        raise DocumentLoaderError(
-            "The google-genai package is not installed (pip install google-genai)"
-        ) from e
-    return genai.Client(
-        api_key=config.GEMINI_API_KEY,
-        http_options=types.HttpOptions(
-            timeout=config.GEMINI_TIMEOUT_MS,
-            # Without retry_options the SDK tries a sync request exactly once.
-            # The SDK retries 408 / 5xx and transient connection errors. 429 is
-            # left out on purpose: _generate() decides per error whether it is a
-            # short rate limit (retry) or an exhausted daily quota (do not retry).
-            retry_options=types.HttpRetryOptions(
-                attempts=config.GEMINI_RETRY_ATTEMPTS,
-                initial_delay=config.GEMINI_RETRY_INITIAL_DELAY,
-                max_delay=config.GEMINI_RETRY_MAX_DELAY,
-                http_status_codes=[408, 500, 502, 503, 504],
-            ),
-        ),
-    )
-
-
-@dataclass
-class _RateLimit:
-    daily: bool                 # daily quota exhausted: retrying cannot help
-    quota_id: str | None        # e.g. GenerateRequestsPerDayPerProjectPerModel-FreeTier
-    retry_delay: float | None   # server-suggested wait (RetryInfo), seconds
-
-
-_DAILY_QUOTA = re.compile(r"per[_ ]?day|daily", re.IGNORECASE)
-_MAX_RATE_LIMIT_WAIT = 60.0  # per-minute windows reset within a minute
-_sleep = time.sleep          # replaced in tests
-
-
-def _classify_429(payload: Any) -> _RateLimit:
-    """Read a Gemini 429 body: is it a per-minute rate limit or the daily quota?
-
-    Signals for "daily": error.code == "quota_exceeded" (documented string code),
-    or a google.rpc.QuotaFailure violation whose quotaId / quotaMetric names a
-    per-day quota. Note that daily-quota errors still carry a short RetryInfo
-    delay, so the delay alone says nothing. Unknown 429s count as rate limits.
-    """
-    err = payload.get("error", payload) if isinstance(payload, dict) else {}
-    err = err if isinstance(err, dict) else {}
-    daily = str(err.get("code", "")).lower() == "quota_exceeded"
-    quota_id = None
-    retry_delay = None
-    for detail in err.get("details") or []:
-        if not isinstance(detail, dict):
-            continue
-        kind = str(detail.get("@type", ""))
-        if kind.endswith("QuotaFailure"):
-            for v in detail.get("violations") or []:
-                if not isinstance(v, dict):
-                    continue
-                names = f"{v.get('quotaId', '')} {v.get('quotaMetric', '')}"
-                if _DAILY_QUOTA.search(names):
-                    daily, quota_id = True, v.get("quotaId") or quota_id
-                else:
-                    quota_id = quota_id or v.get("quotaId")
-        elif kind.endswith("RetryInfo"):
-            match = re.fullmatch(r"(\d+(?:\.\d+)?)s", str(detail.get("retryDelay", "")))
-            if match:
-                retry_delay = float(match.group(1))
-    return _RateLimit(daily, quota_id, retry_delay)
-
-
-def _generate(client: Any, name: str, **request: Any) -> Any:
-    """generate_content with our own handling of 429 (see _classify_429)."""
-    attempts = max(config.GEMINI_RETRY_ATTEMPTS, 1)
-    for attempt in range(1, attempts + 1):
-        try:
-            return client.models.generate_content(**request)
-        except Exception as e:  # google.genai.errors.APIError, duck-typed
-            if getattr(e, "code", None) != 429:
-                raise
-            limit = _classify_429(getattr(e, "details", None))
-            if limit.daily:
-                raise DocumentLoaderError(
-                    f"{name}: Gemini daily quota exhausted "
-                    f"({limit.quota_id or 'quota_exceeded'}); not retrying. "
-                    "Run again after the quota resets; nothing was saved"
-                ) from e
-            if attempt == attempts:
-                raise DocumentLoaderError(
-                    f"{name}: Gemini rate limit (429) persisted after {attempts} attempts; "
-                    "nothing was saved"
-                ) from e
-            backoff = config.GEMINI_RETRY_INITIAL_DELAY * 2 ** (attempt - 1) + random.uniform(0, 1)
-            wait = min(limit.retry_delay if limit.retry_delay is not None else backoff,
-                       _MAX_RATE_LIMIT_WAIT)
-            logger.warning(
-                "%s: Gemini rate limit (429%s), retrying in %.1fs (attempt %d/%d)",
-                name, f", {limit.quota_id}" if limit.quota_id else "", wait, attempt + 1, attempts,
-            )
-            _sleep(wait)
-    raise AssertionError("unreachable")
-
-
 def _call_gemini(client: Any, model: str, contents: list[Any], name: str) -> ParsedDocument:
-    client = client or _make_client()
-    response = _generate(
-        client,
-        name,
-        model=model,
-        contents=contents,
-        config={
-            "system_instruction": SYSTEM_PROMPT,
-            "response_mime_type": "application/json",
-            "response_json_schema": RESPONSE_SCHEMA,
-            "temperature": 0,
-        },
-    )
-    candidates = getattr(response, "candidates", None) or []
-    if not candidates:
-        feedback = getattr(response, "prompt_feedback", None)
-        raise DocumentLoaderError(f"{name}: Gemini returned no answer (prompt_feedback={feedback})")
-    reason = candidates[0].finish_reason
-    reason_name = getattr(reason, "name", str(reason))
-    if reason_name != "STOP":
-        raise DocumentLoaderError(
-            f"{name}: Gemini stopped early (finish_reason={reason_name}); nothing was saved"
-        )
     try:
-        return ParsedDocument.model_validate_json(response.text or "")
+        text = gemini_client.generate_json(
+            client,
+            name=name,
+            model=model,
+            contents=contents,
+            system_instruction=SYSTEM_PROMPT,
+            response_schema=RESPONSE_SCHEMA,
+        )
+    except gemini_client.GeminiError as e:
+        raise DocumentLoaderError(f"{e}; nothing was saved") from e
+    try:
+        return ParsedDocument.model_validate_json(text)
     except ValidationError as e:
         raise DocumentLoaderError(f"{name}: Gemini response is not valid JSON output: {e}") from e
 
