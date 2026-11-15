@@ -56,7 +56,8 @@ Phần trích DOCX dùng thư viện chuẩn của Python (`zipfile` + `xml.etre
 | `temperature` | `0` |
 | `response_mime_type` | `application/json` |
 | `response_json_schema` | `{"paragraphs": [{"page": int \| null, "text": str}]}` |
-| Timeout | `config.GEMINI_TIMEOUT_MS`, mặc định 300 000 ms |
+| Timeout | `config.GEMINI_TIMEOUT_MS`, mặc định 300 000 ms, tính cho mỗi lần thử |
+| Retry | Tối đa `GEMINI_RETRY_ATTEMPTS` = 4 lần thử (1 lần đầu + 3 lần retry) cho 408/5xx và 429 rate limit. Riêng 429 hết quota ngày thì không retry. Chi tiết ở mục 1.6 |
 | Số lần gọi | 1 lần cho mỗi file, gửi cả file trong một request |
 
 System prompt (`SYSTEM_PROMPT`) yêu cầu:
@@ -157,7 +158,27 @@ Lỗi: mọi trường hợp không ingest được đều raise `DocumentLoader
 | Gemini không trả lời / bị cắt / JSON sai | `Gemini returned no answer` / `stopped early (finish_reason=…)` / `not valid JSON output` |
 | Không còn đoạn hợp lệ nào | `no verbatim paragraphs to store (N rejected)` |
 
-Lỗi HTTP từ Gemini (ví dụ 404 do sai tên model, 429 do vượt quota, 5xx) được truyền nguyên dạng `google.genai.errors.APIError`. **Hiện không có retry:** client được tạo không kèm `retry_options`, nên với lời gọi đồng bộ SDK chỉ thử đúng một lần (đã kiểm tra trong `google-genai` 3.3.0). Một lỗi 429 hay 503 tạm thời sẽ làm file đó thất bại. Chạy lại lệnh thì file đó được xử lý tiếp, còn các file đã thành công được bỏ qua.
+Lỗi từ Gemini và cách xử lý retry:
+
+| Lỗi | Ai xử lý | Retry? | Lỗi cuối cùng |
+|---|---|---|---|
+| 408, 500, 502, 503, 504, lỗi kết nối tạm thời | SDK (`HttpRetryOptions`) | Có, tối đa `GEMINI_RETRY_ATTEMPTS` lần thử, backoff lũy thừa | `google.genai.errors.APIError` |
+| 429 **hết quota trong ngày** | Loader (`_generate`) | **Không**, báo lỗi ngay sau 1 lần gọi | `DocumentLoaderError: … daily quota exhausted (<quotaId>); not retrying …` |
+| 429 rate limit theo phút (hoặc 429 không rõ loại) | Loader (`_generate`) | Có, tối đa `GEMINI_RETRY_ATTEMPTS` lần thử | `DocumentLoaderError: … rate limit (429) persisted after N attempts …` |
+| 400 (request sai), 401/403 (key sai hoặc không có quyền), 404 (sai tên model) | | Không, báo lỗi ngay | `google.genai.errors.APIError` |
+
+SDK không được giao xử lý 429, vì nó chỉ nhìn mã HTTP và không phân biệt được hai loại 429. Loader đọc nội dung lỗi (`_classify_429`) và coi là **hết quota trong ngày** khi gặp một trong hai dấu hiệu:
+
+- `error.code` là chuỗi `"quota_exceeded"`. Đây là mã lỗi Gemini ghi trong tài liệu cho trường hợp hết quota ngày.
+- Khối `google.rpc.QuotaFailure` có `quotaId` hoặc `quotaMetric` chứa `PerDay` / `per_day` / `daily`, ví dụ `GenerateRequestsPerDayPerProjectPerModel-FreeTier`. Tài liệu không mô tả cấu trúc này; nó dựa trên dạng response thực tế.
+
+Lưu ý:
+
+- Response hết quota ngày **vẫn** thường kèm `RetryInfo` với thời gian chờ ngắn (ví dụ `33s`), nên loader **không** dựa vào thời gian này để phân loại.
+- 429 không khớp dấu hiệu nào được coi là rate limit và vẫn được retry. Đây là hướng an toàn: nếu thực ra là hết quota ngày, cái giá chỉ là vài lần gọi thừa.
+- Khi retry 429, loader chờ theo `RetryInfo.retryDelay` nếu có. Nếu không có, nó dùng backoff `GEMINI_RETRY_INITIAL_DELAY × 2^(n-1)` cộng jitter 0–1 s. Mỗi lần chờ tối đa 60 s, vì cửa sổ giới hạn theo phút reset trong vòng một phút.
+
+Sau mọi lỗi, file đó không được ghi gì vào DB. Chạy lại lệnh thì file lỗi được xử lý tiếp, còn các file đã thành công được bỏ qua.
 
 `ingest()` / `ingest_with_report()` dừng ở file đầu tiên bị lỗi. Các file trước đó đã được lưu.
 
@@ -169,7 +190,10 @@ Lỗi HTTP từ Gemini (ví dụ 404 do sai tên model, 429 do vượt quota, 5x
 |---|---|---|
 | `GEMINI_API_KEY` | (bắt buộc) | Key Gemini, truyền thẳng vào client. `GOOGLE_API_KEY` **không** được đọc |
 | `GEMINI_MODEL_LOADER` | `gemini-3.5-flash-lite` | Model tách đoạn |
-| `GEMINI_TIMEOUT_MS` | `300000` | Timeout mỗi request |
+| `GEMINI_TIMEOUT_MS` | `300000` | Timeout mỗi lần thử |
+| `GEMINI_RETRY_ATTEMPTS` | `4` | Tổng số lần thử, kể cả lần đầu. `1` = không retry |
+| `GEMINI_RETRY_INITIAL_DELAY` | `2` | Thời gian chờ trước lần retry đầu tiên (giây), dùng khi server không gửi `retryDelay` |
+| `GEMINI_RETRY_MAX_DELAY` | `30` | Thời gian chờ tối đa giữa hai lần thử khi SDK retry 408/5xx (giây). Retry 429 có giới hạn riêng là 60 s |
 | `SPECTEST_INPUT_DIR` | `src/input` | Thư mục `ingest()` quét khi không truyền `files` |
 | `SPECTEST_DB_PATH` | `src/data/spectest.db` | File database |
 
@@ -236,7 +260,7 @@ Các trường hợp đã được kiểm tra:
 
 ### 1.10 Giới hạn hiện tại
 
-- **Không retry** khi Gemini trả 429/5xx (xem mục 1.6).
+- **Thời gian chờ tối đa cho mỗi file** khá dài khi Gemini treo: 4 lần thử × 300 s timeout, cộng thời gian backoff. Giảm `GEMINI_TIMEOUT_MS` nếu cần báo lỗi nhanh hơn.
 - **Một request cho mỗi file.** Tài liệu rất dài có thể vượt giới hạn output của model và gây `MAX_TOKENS`, khi đó file bị từ chối. Cách khắc phục là chia PDF theo trang, hiện chưa làm.
 - **PDF tối đa khoảng 18 MB** (giới hạn inline). Chưa dùng Files API.
 - **PDF scan:** không có text layer nên không kiểm tra được nguyên văn. Passage vẫn được lưu nhưng tính vào `unverified`.

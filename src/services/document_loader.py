@@ -30,8 +30,10 @@ from __future__ import annotations
 import hashlib
 import io
 import logging
-import os
+import random
+import re
 import sys
+import time
 import unicodedata
 import zipfile
 from collections.abc import Iterable
@@ -324,13 +326,104 @@ def _make_client() -> Any:
         ) from e
     return genai.Client(
         api_key=config.GEMINI_API_KEY,
-        http_options=types.HttpOptions(timeout=config.GEMINI_TIMEOUT_MS),
+        http_options=types.HttpOptions(
+            timeout=config.GEMINI_TIMEOUT_MS,
+            # Without retry_options the SDK tries a sync request exactly once.
+            # The SDK retries 408 / 5xx and transient connection errors. 429 is
+            # left out on purpose: _generate() decides per error whether it is a
+            # short rate limit (retry) or an exhausted daily quota (do not retry).
+            retry_options=types.HttpRetryOptions(
+                attempts=config.GEMINI_RETRY_ATTEMPTS,
+                initial_delay=config.GEMINI_RETRY_INITIAL_DELAY,
+                max_delay=config.GEMINI_RETRY_MAX_DELAY,
+                http_status_codes=[408, 500, 502, 503, 504],
+            ),
+        ),
     )
+
+
+@dataclass
+class _RateLimit:
+    daily: bool                 # daily quota exhausted: retrying cannot help
+    quota_id: str | None        # e.g. GenerateRequestsPerDayPerProjectPerModel-FreeTier
+    retry_delay: float | None   # server-suggested wait (RetryInfo), seconds
+
+
+_DAILY_QUOTA = re.compile(r"per[_ ]?day|daily", re.IGNORECASE)
+_MAX_RATE_LIMIT_WAIT = 60.0  # per-minute windows reset within a minute
+_sleep = time.sleep          # replaced in tests
+
+
+def _classify_429(payload: Any) -> _RateLimit:
+    """Read a Gemini 429 body: is it a per-minute rate limit or the daily quota?
+
+    Signals for "daily": error.code == "quota_exceeded" (documented string code),
+    or a google.rpc.QuotaFailure violation whose quotaId / quotaMetric names a
+    per-day quota. Note that daily-quota errors still carry a short RetryInfo
+    delay, so the delay alone says nothing. Unknown 429s count as rate limits.
+    """
+    err = payload.get("error", payload) if isinstance(payload, dict) else {}
+    err = err if isinstance(err, dict) else {}
+    daily = str(err.get("code", "")).lower() == "quota_exceeded"
+    quota_id = None
+    retry_delay = None
+    for detail in err.get("details") or []:
+        if not isinstance(detail, dict):
+            continue
+        kind = str(detail.get("@type", ""))
+        if kind.endswith("QuotaFailure"):
+            for v in detail.get("violations") or []:
+                if not isinstance(v, dict):
+                    continue
+                names = f"{v.get('quotaId', '')} {v.get('quotaMetric', '')}"
+                if _DAILY_QUOTA.search(names):
+                    daily, quota_id = True, v.get("quotaId") or quota_id
+                else:
+                    quota_id = quota_id or v.get("quotaId")
+        elif kind.endswith("RetryInfo"):
+            match = re.fullmatch(r"(\d+(?:\.\d+)?)s", str(detail.get("retryDelay", "")))
+            if match:
+                retry_delay = float(match.group(1))
+    return _RateLimit(daily, quota_id, retry_delay)
+
+
+def _generate(client: Any, name: str, **request: Any) -> Any:
+    """generate_content with our own handling of 429 (see _classify_429)."""
+    attempts = max(config.GEMINI_RETRY_ATTEMPTS, 1)
+    for attempt in range(1, attempts + 1):
+        try:
+            return client.models.generate_content(**request)
+        except Exception as e:  # google.genai.errors.APIError, duck-typed
+            if getattr(e, "code", None) != 429:
+                raise
+            limit = _classify_429(getattr(e, "details", None))
+            if limit.daily:
+                raise DocumentLoaderError(
+                    f"{name}: Gemini daily quota exhausted "
+                    f"({limit.quota_id or 'quota_exceeded'}); not retrying. "
+                    "Run again after the quota resets; nothing was saved"
+                ) from e
+            if attempt == attempts:
+                raise DocumentLoaderError(
+                    f"{name}: Gemini rate limit (429) persisted after {attempts} attempts; "
+                    "nothing was saved"
+                ) from e
+            backoff = config.GEMINI_RETRY_INITIAL_DELAY * 2 ** (attempt - 1) + random.uniform(0, 1)
+            wait = min(limit.retry_delay if limit.retry_delay is not None else backoff,
+                       _MAX_RATE_LIMIT_WAIT)
+            logger.warning(
+                "%s: Gemini rate limit (429%s), retrying in %.1fs (attempt %d/%d)",
+                name, f", {limit.quota_id}" if limit.quota_id else "", wait, attempt + 1, attempts,
+            )
+            _sleep(wait)
+    raise AssertionError("unreachable")
 
 
 def _call_gemini(client: Any, model: str, contents: list[Any], name: str) -> ParsedDocument:
     client = client or _make_client()
-    response = client.models.generate_content(
+    response = _generate(
+        client,
+        name,
         model=model,
         contents=contents,
         config={
