@@ -33,7 +33,12 @@ OUTPUT_DIR = Path(os.getenv("SPECTEST_OUTPUT_DIR", SRC_DIR / "output"))   # expo
 DATA_DIR = Path(os.getenv("SPECTEST_DATA_DIR", SRC_DIR / "data"))         # app state, gitignored
 DB_PATH = Path(os.getenv("SPECTEST_DB_PATH", DATA_DIR / "spectest.db"))
 
-# Gemini. The SDK reads the API key from GEMINI_API_KEY (or GOOGLE_API_KEY).
+# Gemini. GEMINI_API_KEY is passed to the client explicitly (GOOGLE_API_KEY is not read).
 GEMINI_MODEL_LOADER = os.getenv("GEMINI_MODEL_LOADER", "gemini-3.5-flash-lite")
+GEMINI_MODEL_EXTRACTOR = os.getenv("GEMINI_MODEL_EXTRACTOR", "gemini-3.8-flash")
 GEMINI_TIMEOUT_MS = int(os.getenv("GEMINI_TIMEOUT_MS", "300000"))
+# Retries on 408 / 429 / 5xx and transient network errors, exponential backoff.
+GEMINI_RETRY_ATTEMPTS = int(os.getenv("GEMINI_RETRY_ATTEMPTS", "4"))      # total tries, 1 = no retry
+GEMINI_RETRY_INITIAL_DELAY = float(os.getenv("GEMINI_RETRY_INITIAL_DELAY", "2"))  # seconds
+GEMINI_RETRY_MAX_DELAY = float(os.getenv("GEMINI_RETRY_MAX_DELAY", "30"))          # seconds
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")

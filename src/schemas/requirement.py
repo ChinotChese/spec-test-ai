@@ -31,25 +31,58 @@ RequirementStatus = Literal["pending", "approved", "rejected"]
 class Evidence(Contract):
     """One source passage that supports the requirement."""
 
-    passage_id: Text
-    quote: Text | None = None  # exact excerpt from the passage, if available
+    passage_id: Text = Field(description="Id of a source passage that states this requirement.")
+    quote: Text | None = Field(
+        default=None,
+        description="Exact words copied from that passage which support the requirement.",
+    )
 
 
 class RequirementDraft(Contract):
-    type: RequirementType
-    statement: Text  # "shall" form, e.g. "Upon <event>, the system shall <action>."
-    priority: Priority
-    evidence: list[Evidence] = Field(min_length=1)
+    # Field descriptions are part of the JSON schema sent to the model as
+    # structured-output instructions; they do not change validation.
+    type: RequirementType = Field(
+        description="functional: something the system does. "
+        "nonfunctional: a quality or constraint on how it does it."
+    )
+    statement: Text = Field(
+        description='One verifiable requirement in English "shall" form, e.g. '
+        '"Upon <event>, the system shall <action>."'
+    )
+    priority: Priority = Field(description="MoSCoW priority as expressed by the source.")
+    evidence: list[Evidence] = Field(
+        min_length=1, description="Source passages that state this requirement."
+    )
 
     # functional only (section 5)
-    feature: Text | None = None
-    stimulus_or_condition: Text | None = None
-    response: Text | None = None
+    feature: Text | None = Field(
+        default=None,
+        description="Functional only, required: short feature name; "
+        "related requirements share exactly the same name.",
+    )
+    stimulus_or_condition: Text | None = Field(
+        default=None,
+        description="Functional only, optional: the triggering event or condition. "
+        "Give together with response, or omit both.",
+    )
+    response: Text | None = Field(
+        default=None, description="Functional only, optional: the system's response."
+    )
 
     # nonfunctional only (section 6)
-    nfr_category: Text | None = None  # "Performance", "Security", or another category
-    verification_method: VerificationMethod | None = None
-    acceptance_measure: Text | None = None
+    nfr_category: Text | None = Field(
+        default=None,
+        description='Nonfunctional only, required: "Performance", "Security", '
+        "or another short quality category.",
+    )
+    verification_method: VerificationMethod | None = Field(
+        default=None, description="Nonfunctional only, required: how it would be verified."
+    )
+    acceptance_measure: Text | None = Field(
+        default=None,
+        description="Nonfunctional only, required: the verifiable condition, "
+        "in the source's own terms.",
+    )
 
     @model_validator(mode="after")
     def check_type_fields(self):
