@@ -5,8 +5,8 @@
 | File | Bước trong `app.py` | Trạng thái |
 |---|---|---|
 | [document_loader.py](document_loader.py) | 1. Đọc tài liệu, lưu passage | ✔ Đã triển khai |
-| [evidence_validator.py](evidence_validator.py) | 3. Kiểm tra evidence của requirement | Chưa triển khai (file trống) |
-| [requirement_registry.py](requirement_registry.py) | 3–5. Lưu requirement chờ duyệt, lấy requirement đã duyệt | Chưa triển khai (file trống) |
+| [evidence_validator.py](evidence_validator.py) | 3. Kiểm tra evidence (quote có thật trong passage) | ✔ Đã triển khai |
+| [requirement_registry.py](requirement_registry.py) | 3–5. Cấp id, lưu requirement chờ duyệt, approve/reject, lấy requirement đã duyệt | ✔ Đã triển khai |
 | [srs_validator.py](srs_validator.py) | 7. Kiểm tra SRS trước khi export | Chưa triển khai (file trống) |
 
 Tài liệu liên quan:
@@ -270,13 +270,142 @@ Các trường hợp đã được kiểm tra:
 
 ---
 
-## 2. Service chưa triển khai
+## 2. `evidence_validator.py`
 
-Dưới đây là vai trò dự kiến, suy ra từ `app.py`. Phần này **chưa phải đặc tả cuối cùng**.
+Kiểm tra evidence của requirement có thật sự lấy từ tài liệu nguồn. Đây là bước 3 trong `app.py`, chạy trước khi lưu, và được **chạy lại lúc approve**.
+
+### 2.1 Định nghĩa evidence hợp lệ
+
+Chỉ có **một** định nghĩa, dùng chung cho cả `validate()`, `save_candidates()`, `approve()` và `get_approved()`. Requirement có evidence hợp lệ khi:
+
+1. Có **ít nhất một** evidence, và **mọi** evidence item đều:
+2. trỏ tới passage **có trong** `source_passages`;
+3. có `quote` (quote thiếu, hoặc chỉ gồm khoảng trắng/dấu câu, thì không kiểm chứng được nên không hợp lệ);
+4. quote **nằm trong chính passage được trích**.
+
+Quote được so khớp sau khi chuẩn hóa bằng đúng hàm `_normalize` của `document_loader` (NFKC, casefold, chỉ giữ chữ và số). Vì vậy khác biệt về khoảng trắng, dấu câu, gạch nối hay chữ hoa thường được bỏ qua, nhưng chữ bị đổi hoặc bịa thêm thì không qua.
+
+**Một evidence item sai làm cả requirement không hợp lệ.** Requirement không bị cắt bớt cho còn các item hợp lệ, vì khi đó statement sẽ khẳng định nhiều hơn những gì evidence còn lại chứng minh. Đây là cùng nguyên tắc extractor áp dụng với passage id lạ.
+
+`schemas.requirement.Evidence.quote` vẫn là tùy chọn trong schema. Quy tắc "phải có quote" chỉ áp dụng ở bước kiểm tra này.
+
+| Vấn đề | Thông báo |
+|---|---|
+| Không có evidence | `no evidence` |
+| Passage không tồn tại | `DOC-…-P0999: passage not found` |
+| Thiếu quote / quote rỗng | `DOC-…-P0002: no quote to verify` |
+| Quote không có trong passage (bịa, hoặc lấy từ passage khác) | `DOC-…-P0001: quote not found in passage: '…'` |
+
+### 2.2 API
+
+```python
+from services import evidence_validator
+```
+
+| Hàm | Mô tả |
+|---|---|
+| `validate(candidates, *, repo=None) -> list[RequirementDraft]` | Các candidate có evidence hợp lệ, giữ thứ tự. Candidate không hợp lệ được ghi log `WARNING`. Đây là hàm `app.py` gọi |
+| `validate_with_report(candidates, *, repo=None) -> ValidationReport` | `valid: list[RequirementDraft]`, `invalid: list[InvalidCandidate]` (`candidate`, `problems`) |
+| `evidence_problems(requirement, repo) -> list[str]` | Danh sách vấn đề của một requirement; danh sách rỗng là hợp lệ. Nhận `RequirementDraft`, `Requirement` hoặc dict từ repository |
+| `using_repo(repo)` | Context manager: dùng `repo` được truyền vào, nếu không thì mở `config.DB_PATH` và tự đóng |
+| `as_draft(candidate)` | Chuyển dict (kể cả dict có field thừa như `id`, `status`) thành `RequirementDraft` |
+
+`candidates` có thể là `RequirementDraft` hoặc dict. Passage được đọc từ DB bằng một truy vấn duy nhất. Hàm này không gọi model và không ghi gì.
+
+---
+
+## 3. `requirement_registry.py`
+
+Lưu requirement chờ duyệt, cấp id, và chặn approve khi evidence không hợp lệ.
+
+### 3.1 Quy tắc approve (điều kiện "done")
+
+- **Không có đường nào tự động approve.** `save_candidates()` luôn lưu `status = "pending"`, kể cả khi đầu vào ghi `"approved"`.
+- **Chỉ `approve(id)` chuyển sang `approved`**, và nó **kiểm tra lại evidence đang lưu trong DB** ngay lúc approve (mục 2.1). Evidence không hợp lệ thì raise `RegistryError`, status giữ nguyên.
+- **`get_approved()` kiểm tra lại lần nữa** trước khi giao cho SRS generator. Lý do: một requirement vẫn có thể thành `approved` mà không qua `approve()`, ví dụ do gọi thẳng `repo.set_requirement_status()` hoặc sửa evidence sau khi đã approve. Khi đó `get_approved()` raise `RegistryError` liệt kê các requirement có vấn đề, thay vì âm thầm sinh SRS từ chúng.
+- **`repo.set_requirement_status()` vẫn đổi được status mà không qua kiểm tra** (tầng database không biết về quote). Lỗ hổng này được `get_approved()` bắt lại, nhưng không bị chặn ngay tại repository.
+
+### 3.2 Id
+
+| | Quy tắc |
+|---|---|
+| Dạng | `RQ-` + 4 chữ số: `RQ-0001`, `RQ-0002`, … (vượt 9999 thì tự dài thêm) |
+| Cấp số | Số lớn nhất của các id `RQ-` đang có + 1, **không** dựa trên số dòng. Id bị xóa không được dùng lại nếu nó không phải id lớn nhất |
+| Tính nguyên tử | Cấp id và lưu mọi requirement trong **một transaction** (`repo.add_requirements_with_sequential_ids`). Một dòng lỗi thì không lưu dòng nào |
+| Phân biệt với SRS | Đây là id lưu trữ, khác id theo vị trí trong SRS (`REQ-1.1`, `NF-2.1`). Id không chứa FR/NFR, vì loại requirement có thể sửa |
+
+Quá trình cấp số giả định chỉ có một tiến trình ghi vào DB (ứng dụng chạy local, một người dùng). Hai tiến trình cùng lưu một lúc có thể tranh cùng một số; khi đó transaction sau sẽ bị khóa chính chặn lại và không lưu gì.
+
+### 3.3 Chống trùng
+
+`save_candidates()` bỏ qua candidate có `statement` trùng (bỏ qua hoa thường và khoảng trắng) với:
+
+- một requirement đã lưu, **ở mọi status**: requirement đã từng bị reject sẽ không quay lại qua lần trích xuất sau;
+- một candidate trước đó trong cùng lô.
+
+Candidate bị bỏ qua được trả trong `SaveResult.duplicates` dưới dạng `(statement, id đã có)`. **Câu cùng ý nhưng diễn đạt khác không bị phát hiện**, nên chạy lại extractor (vốn cho kết quả dao động) vẫn có thể thêm bản gần trùng. Người review cần reject các bản này.
+
+### 3.4 API
+
+```python
+from services import requirement_registry
+```
+
+| Hàm | Trả về | Mô tả |
+|---|---|---|
+| `save_candidates(candidates, *, repo=None)` | `SaveResult` (`saved_ids`, `duplicates`) | Lưu `pending`, cấp id, all-or-nothing. **Raise `RegistryError` và không lưu gì** nếu có candidate có evidence không hợp lệ: hãy lọc bằng `evidence_validator.validate()` trước |
+| `approve(id, *, repo=None)` | `Requirement` | Kiểm tra evidence rồi approve. Lỗi thì `RegistryError`, status giữ nguyên |
+| `reject(id, *, repo=None)` | dict (dòng repository) | Reject, không cần kiểm tra evidence |
+| `get(id, *, repo=None)` | dict | Một dòng, kèm `evidence`. `RegistryError` nếu không tồn tại |
+| `list_by_status(status=None, *, repo=None)` | `list[dict]` | Các dòng theo status, theo thứ tự tạo |
+| `get_approved(*, repo=None)` | `list[Requirement]` | Requirement đã approve, có kiểm tra lại evidence (mục 3.1). Đây là hàm `app.py` gọi ở bước 5 |
+
+`get`, `list_by_status` và `reject` trả dict thô thay vì `Requirement`, vì một dòng trong DB có thể hỏng (ví dụ không có evidence sau khi chèn thẳng bằng SQL), và người review vẫn phải xem được và reject được dòng đó. `approve` và `get_approved` trả `Requirement`, vì evidence của chúng đã được kiểm tra.
+
+### 3.5 Duyệt từ dòng lệnh
+
+Chạy từ `src/`:
+
+```bash
+uv run python -m services.requirement_registry list [pending|approved|rejected]
+uv run python -m services.requirement_registry show RQ-0024
+uv run python -m services.requirement_registry approve RQ-0013 RQ-0014
+uv run python -m services.requirement_registry reject RQ-0020
+```
+
+- `list`: mỗi requirement một dòng; requirement có evidence không hợp lệ được đánh dấu `[INVALID EVIDENCE]`.
+- `show`: in mọi field, từng quote **kèm text của passage gốc** để người review đối chiếu, và kết quả kiểm tra evidence.
+- `approve` / `reject`: xử lý từng id. Lỗi của một id không làm dừng các id còn lại. Exit code là 1 nếu có id lỗi.
+
+```
+RQ-0013: approved
+ERROR Requirement 'RQ-9999' not found
+```
+
+### 3.6 Kết quả trên dữ liệu thật
+
+Dữ liệu là 39 requirement của lần trích xuất thứ 4 ([agents/spec.md](../agents/spec.md) mục 1.9), chạy trên **bản sao** của DB:
+
+- 48 evidence item, tất cả đều có quote; cả 39 requirement có evidence hợp lệ.
+- Id được cấp `RQ-0001` đến `RQ-0039`. Lưu lại lần hai: 0 requirement được lưu, 39 bị bỏ qua vì trùng.
+- `approve RQ-0013` thành công; `get_approved()` trả đúng requirement đó.
+
+### 3.7 Test
+
+Chạy trên DB in-memory, các trường hợp đã kiểm tra:
+
+- **Evidence:** quote bịa, quote lấy từ passage khác, thiếu quote, quote chỉ gồm dấu câu, passage không tồn tại, và requirement có evidence lẫn lộn đều bị loại; quote chỉ khác hoa thường hay dấu câu vẫn hợp lệ.
+- **Lưu:** lô có evidence không hợp lệ không lưu gì; trùng trong cùng lô và trùng với dữ liệu đã có đều bị bỏ qua; status `approved` ở đầu vào bị bỏ qua; id tiếp nối số lớn nhất kể cả khi có khoảng trống; một dòng lỗi giữa lô làm cả lô rollback.
+- **Approve:** requirement hợp lệ được approve; approve bị từ chối khi quote đã lưu bị sửa (status giữ nguyên), khi không có evidence, hoặc khi id không tồn tại; requirement đã reject vẫn approve lại được.
+- **`get_approved()`** từ chối requirement được set `approved` qua repository mà evidence không hợp lệ.
+- **Dòng hỏng** (không có evidence) vẫn liệt kê, xem và reject được.
+
+---
+
+## 4. Service chưa triển khai
+
+Vai trò dự kiến, suy ra từ `app.py`. Phần này **chưa phải đặc tả cuối cùng**.
 
 | Service | Vai trò theo `app.py` | Sẽ dùng |
 |---|---|---|
-| `evidence_validator.validate(candidates)` | Lọc `RequirementDraft` từ extractor: mỗi evidence phải trỏ tới passage có thật, `quote` (nếu có) phải nằm trong text của passage | `repo.get_passages()`, `schemas.requirement.RequirementDraft` |
-| `requirement_registry.save_candidates(...)` | Lưu requirement hợp lệ với `status="pending"` | `repo.add_requirement(**draft.model_dump())` |
-| `requirement_registry.get_approved()` | Lấy requirement đã duyệt để sinh SRS | `repo.get_approved_requirements()` → `Requirement` |
 | `srs_validator.validate(srs, requirements)` | Kiểm tra SRS trước khi export: đúng `schemas.srs.SRS`, chỉ chứa requirement đã duyệt, không còn placeholder `<...>` | `schemas.srs.SRS`, `SRS.requirement_ids()` |
