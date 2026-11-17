@@ -135,6 +135,7 @@ Requirement đã lưu. Gồm mọi field của `RequirementDraft`, cộng thêm:
 |---|---|---|---|
 | `id` | `Text` | | Id trong database, ví dụ `REQ-001` hoặc uuid. **Không phải** id vị trí trong SRS |
 | `status` | `pending` \| `approved` \| `rejected` | `pending` | Chỉ requirement `approved` mới được đưa vào SRS |
+| `project_id` | `Text \| None` | `None` | Dự án sở hữu requirement; `None` = chưa gán ([database/spec.md](../database/spec.md) mục 2.9, 8). Không có trong `RequirementDraft` |
 | `created_at` | `str \| None` | `None` | ISO 8601 UTC, do database sinh |
 | `updated_at` | `str \| None` | `None` | |
 

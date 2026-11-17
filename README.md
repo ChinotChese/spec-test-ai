@@ -70,7 +70,7 @@ src/
 ├── exporters/
 │   └── markdown.py
 ├── schemas/               Model Pydantic: RequirementDraft / Requirement, SRS (IEEE 830)
-├── database/              SQLite: schema.sql, repository, init_db, evidence_rules
+├── database/              SQLite: migrations/, migrate, project_backfill, repository, init_db, evidence_rules
 ├── templates/             IEEE_830_SRS_Template.md, standard_srs.yaml
 ├── input/                 Tài liệu nguồn            (gitignored)
 ├── data/                  spectest.db               (gitignored)
@@ -173,7 +173,16 @@ Database created: .../src/data/spectest.db
 Schema OK
 ```
 
-Lệnh tạo `src/data/spectest.db` nếu chưa có, và kiểm tra DB hiện có còn khớp `database/schema.sql` không. Dự án chưa có cơ chế migration: khi schema đổi, chạy `--reset` (lệnh này **xóa toàn bộ dữ liệu**).
+Lệnh tạo `src/data/spectest.db` nếu chưa có (chạy toàn bộ `database/migrations/*.sql`), và kiểm tra DB hiện có đã ở phiên bản schema mới nhất chưa. Nếu DB cũ hơn code, **không cần xóa dữ liệu**: chạy
+
+```bash
+uv run python -m database.migrate up                 # backup file DB, rồi chạy các migration còn thiếu
+uv run python -m database.project_backfill plan      # (sau 002_projects) đề xuất tài liệu -> dự án
+uv run python -m database.project_backfill apply     # gán dự án cho những gì không mơ hồ
+uv run python -m database.project_backfill review    # những requirement / SRS run còn cần người quyết định
+```
+
+Chi tiết: [database/spec.md](src/database/spec.md) mục 7–8. `--reset` vẫn còn nhưng **xóa toàn bộ dữ liệu**.
 
 ### Bước 1. Ingest tài liệu
 
@@ -312,7 +321,8 @@ uv run python -c "import app; print(app.generate_approved_srs())"     # bước 
 
 | Triệu chứng | Nguyên nhân / cách xử lý |
 |---|---|
-| `RepositoryError: … does not match schema.sql` | DB tạo từ schema cũ. Chạy `python -m database.init_db` để xem bảng hoặc cột lệch; `--reset` để tạo lại (xóa dữ liệu) |
+| `RepositoryError: … database is at version N but the code needs M` | DB cũ hơn code. Chạy `python -m database.migrate up` (tự backup trước, giữ nguyên dữ liệu) |
+| `RepositoryError: … no migration history and its tables do not match migration 001` | DB tạo từ một schema rất cũ (trước phase 1), không migrate được. Lấy ra dữ liệu cần giữ, rồi `python -m database.init_db --reset` |
 | `GEMINI_API_KEY is not set` | Thiếu key trong `src/.env` |
 | `Gemini HTTP 404 NOT_FOUND` | Sai tên model trong `GEMINI_MODEL_*` |
 | `Gemini daily quota exhausted (…)` | Hết quota trong ngày; chạy lại sau khi quota reset. File hoặc tài liệu đã xử lý xong sẽ được bỏ qua |
@@ -333,7 +343,7 @@ uv run python -c "import app; print(app.generate_approved_srs())"     # bước 
 
 ## 8. Giới hạn hiện tại
 
-- **Chưa có khái niệm dự án** trong DB. Bước 5 dùng mọi requirement đang `approved` (xem lưu ý ở bước 4).
+- **Dự án mới có ở tầng database**, pipeline chưa dùng. Đã có bảng `projects`, `project_documents` và cột `project_id` (migration `002_projects`), nhưng ingest, extractor, registry và bước 5 chưa truyền `project_id`. Bước 5 vẫn dùng mọi requirement đang `approved` (xem lưu ý ở bước 4); requirement mới sinh có `project_id = NULL` cho tới khi được gán bằng `database.project_backfill assign`.
 - **Kết quả của model dao động giữa các lần chạy.** Bước review ở bước 4 là nơi bắt các requirement bị gộp, sót hoặc gần trùng. Chống trùng chỉ bắt câu giống hệt nhau.
 - **Phần văn xuôi và các cặp stimulus/response trong SRS do model viết.** Code bảo đảm chúng liên kết đúng requirement và trích nguồn có thật, nhưng vẫn cần người đọc lại trước khi gửi khách.
 - **Mỗi tài liệu được xử lý trong một lần gọi model.** Tài liệu rất dài có thể gây `MAX_TOKENS`.
