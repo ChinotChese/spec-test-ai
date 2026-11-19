@@ -67,3 +67,11 @@ QDRANT_API_KEY = os.getenv("QDRANT_API_KEY") or None
 QDRANT_HTTPS = _optional_bool("QDRANT_HTTPS")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "source_passages")
 QDRANT_TIMEOUT = int(os.getenv("QDRANT_TIMEOUT", "30"))  # seconds
+
+# SRS generator evidence (agents.srs_generator): passages cited by the approved
+# requirements, plus passages retrieved (retrieval.retriever) for each narrative
+# section and each feature. TOP_K per query; MAX caps the retrieved extras
+# (cited passages are always sent and do not count).
+SRS_RETRIEVAL_MODE = os.getenv("SRS_RETRIEVAL_MODE", "hybrid")  # hybrid / dense / sparse
+SRS_RETRIEVAL_TOP_K = int(os.getenv("SRS_RETRIEVAL_TOP_K", "4"))
+SRS_RETRIEVAL_MAX_PASSAGES = int(os.getenv("SRS_RETRIEVAL_MAX_PASSAGES", "40"))

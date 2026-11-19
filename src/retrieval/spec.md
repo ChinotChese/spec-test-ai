@@ -275,9 +275,15 @@ retriever.search_passages("PRJ-...", "thời hạn mật khẩu", top_k=8, mode=
 retriever.search_points("PRJ-...", "...", top_k=8, mode="sparse", with_payload=["passage_id"])
 # -> list[ScoredPoint] của qdrant-client
 
+retriever.search_many("PRJ-...", {"purpose": "...", "feature:Login": "..."}, top_k=4)
+# -> {"purpose": ["DOC-...-P0003", ...], "feature:Login": [...]}
+#    mọi câu truy vấn: 1 lần gọi Gemini embedding + 1 lần query_batch_points
+
 retriever.retrieve_evidence("PRJ-...", query_vector, top_k=8)
 # -> chỉ dense, với vector câu hỏi đã tính sẵn
 ```
+
+`search_many` là hàm SRS generator dùng để lấy evidence cho từng narrative section và từng feature ([agents/spec.md](../agents/spec.md) mục 2.2).
 
 Mọi hàm nhận thêm `client=`, `embed_client=`, `collection=` để tiêm phụ thuộc trong test. Client Qdrant mặc định được tạo một lần, khi cần lần đầu (không tạo lúc import).
 
@@ -357,7 +363,7 @@ Không dùng mạng: Qdrant chạy ở chế độ local trong bộ nhớ, Gemin
 
 ## 9. Giới hạn hiện tại
 
-- **Chưa tự động**: pipeline trong `app.py` chưa gọi indexer, và chưa dùng retriever để chọn passage cho requirement extractor.
+- **Chưa tự động**: pipeline trong `app.py` chưa gọi indexer sau khi ingest. SRS generator đã dùng retriever, nhưng requirement extractor thì chưa.
 - **Quét toàn bộ collection mỗi lần chạy** (chỉ payload, không vector). Phù hợp với vài chục nghìn passage; lớn hơn thì nên chuyển sang theo dõi trạng thái index trong SQLite.
 - **Lần chạy có phạm vi** không sửa point ngoài phạm vi có text đã đổi (mục 3.3).
 - **BM25 không stemming**: "requirement" và "requirements" là hai từ khác nhau. Tiếng Việt được tách theo âm tiết, không theo từ ghép.

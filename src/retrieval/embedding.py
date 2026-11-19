@@ -55,6 +55,11 @@ def embed_query(text: str, *, client: Any = None) -> list[float]:
     return _embed([text], QUERY_TASK, client)[0]
 
 
+def embed_queries(texts: Sequence[str], *, client: Any = None) -> list[list[float]]:
+    """Several search queries in as few calls as possible (batches of 100)."""
+    return _embed(list(texts), QUERY_TASK, client)
+
+
 def _embed(texts: list[str], task_type: str, client: Any) -> list[list[float]]:
     if not texts:
         return []

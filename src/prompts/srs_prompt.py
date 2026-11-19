@@ -13,6 +13,15 @@ Adapted from AI-Requirement-Engineering-System/prompts/srs_prompt.py:
   dropped  - "generate detailed functional requirements", "generate
              non-functional requirements based on the project context",
              risks and future enhancements: none of these may be invented.
+
+Prompt layout (CAG, long context), most stable first so the prefix can be
+cached:
+  system instruction  SYSTEM_PROMPT + core context (context.core_context:
+                      SRS template, glossary, requirement guidelines)
+  user content        <approved_requirements>, then <source_passages>
+                      (passages cited by the requirements + passages retrieved
+                      for the narrative sections and features), then retry
+                      feedback.
 """
 
 SYSTEM_PROMPT = """\
@@ -27,6 +36,15 @@ from them by code. You write only:
      4.x External Interface Requirements);
   2. for each feature: a short description (1-3 sentences) and its
      stimulus/response sequences.
+
+CORE CONTEXT
+- The <core_context> at the end of these instructions holds the SRS template,
+  the company glossary and the requirement guidelines. Follow its structure,
+  terminology and writing rules.
+- It is guidance on HOW to write, never a source of facts about the product:
+  do not take product facts from it and never cite it in "source_ids".
+- Where it conflicts with these instructions (everything before
+  <core_context>), these instructions win.
 
 GROUNDING (most important)
 - Use only the approved requirements and the source passages provided.
@@ -76,13 +94,25 @@ FEATURES
 """
 
 
+def build_system_instruction(core_context_text: str | None) -> str:
+    """SYSTEM_PROMPT followed by the rendered core context (stable prefix)."""
+    if not core_context_text:
+        return SYSTEM_PROMPT
+    return SYSTEM_PROMPT + "\n" + core_context_text
+
+
 def build_user_prompt(
     features: list[tuple[str, list[dict]]],
     nonfunctional: list[dict],
     passages: list[dict],
     feedback: list[str] | None = None,
 ) -> str:
-    """Approved requirements grouped by feature, NFRs for context, and passages."""
+    """Approved requirements grouped by feature, NFRs for context, and passages.
+
+    A passage dict may carry "cited" (True: evidence of an approved
+    requirement) and "retrieved_for" (section / feature keys it was retrieved
+    for); both are shown as attributes to help the model pick sources.
+    """
     lines = ["<approved_requirements>"]
     for name, reqs in features:
         lines.append(f'<feature name="{name}">')
@@ -100,8 +130,12 @@ def build_user_prompt(
     lines.append("")
     lines.append("<source_passages>")
     for p in passages:
-        page = f' page="{p["page"]}"' if p.get("page") is not None else ""
-        lines.append(f'<passage id="{p["id"]}"{page}>{p["text"]}</passage>')
+        attrs = f' page="{p["page"]}"' if p.get("page") is not None else ""
+        if p.get("cited"):
+            attrs += ' cited="true"'
+        if p.get("retrieved_for"):
+            attrs += f' retrieved_for="{",".join(p["retrieved_for"])}"'
+        lines.append(f'<passage id="{p["id"]}"{attrs}>{p["text"]}</passage>')
     lines.append("</source_passages>")
     if feedback:
         lines.append("")
