@@ -15,7 +15,7 @@ Nguyên tắc xuyên suốt: model AI được dùng để *đọc* và *viết*
 1. [Kiến trúc](#1-kiến-trúc)
 2. [Cài đặt](#2-cài-đặt)
 3. [Chạy từng bước](#3-chạy-từng-bước)
-4. [Chạy nhanh bằng `app.py`](#4-chạy-nhanh-bằng-apppy)
+4. [Chạy nhanh bằng](#4-chạy-nhanh-bằng-apppy) `app.py`
 5. [Cấu hình](#5-cấu-hình)
 6. [Xử lý sự cố](#6-xử-lý-sự-cố)
 7. [Dữ liệu và quyền riêng tư](#7-dữ-liệu-và-quyền-riêng-tư)
@@ -148,7 +148,8 @@ GEMINI_MODEL_GENERATOR=gemini-3.8-flash
 
 `src/.env` không được commit. Các biến khác xem ở [mục 5](#5-cấu-hình).
 
-> Mọi lệnh bên dưới **chạy từ thư mục `src/`**. Có thể chạy bằng `uv run python …`, hoặc kích hoạt venv rồi chạy `python …`:
+> Mọi lệnh bên dưới **chạy từ thư mục** `src/`. Có thể chạy bằng `uv run python …`, hoặc kích hoạt venv rồi chạy `python …`:
+>
 > - Windows PowerShell: `..\.venv\Scripts\Activate.ps1`
 > - Git Bash: `source ../.venv/Scripts/activate`
 > - macOS / Linux: `source ../.venv/bin/activate`
@@ -209,8 +210,8 @@ Tài liệu được liên kết với dự án trong cùng transaction với vi
 INFO proposal_a.pdf: DOC-1a2b3c4d5e6f, 98 passages, 0 rejected, 0 unverified, coverage 92%
 ```
 
-- **`rejected`:** số đoạn Gemini trả về nhưng không khớp nguyên văn tài liệu. Các đoạn này bị bỏ và được ghi vào log.
-- **`coverage`:** tỷ lệ text gốc được giữ lại thành passage. Với PDF, dưới 100% là bình thường, vì header/footer lặp lại ở mỗi trang bị bỏ.
+- `rejected`**:** số đoạn Gemini trả về nhưng không khớp nguyên văn tài liệu. Các đoạn này bị bỏ và được ghi vào log.
+- `coverage`**:** tỷ lệ text gốc được giữ lại thành passage. Với PDF, dưới 100% là bình thường, vì header/footer lặp lại ở mỗi trang bị bỏ.
 - **Chạy lại** thì file đã ingest được bỏ qua, không gọi Gemini lần nữa.
 
 ### Bước 2. Xem thử requirement được trích (không lưu)
@@ -252,9 +253,9 @@ uv run python -m services.requirement_registry approve RQ-0005 RQ-0006
 uv run python -m services.requirement_registry reject RQ-0007
 ```
 
-- **`show`** in từng quote **kèm nguyên văn passage gốc** để đối chiếu, và cho biết evidence có hợp lệ không.
-- **`list`** đánh dấu `[INVALID EVIDENCE]` cho requirement không thể approve.
-- **`approve`** bị từ chối, và status giữ nguyên, nếu evidence không hợp lệ. Quy tắc này được thực thi ở cả tầng repository.
+- `show` in từng quote **kèm nguyên văn passage gốc** để đối chiếu, và cho biết evidence có hợp lệ không.
+- `list` đánh dấu `[INVALID EVIDENCE]` cho requirement không thể approve.
+- `approve` bị từ chối, và status giữ nguyên, nếu evidence không hợp lệ. Quy tắc này được thực thi ở cả tầng repository.
 
 > **Lưu ý:** mỗi requirement thuộc đúng một dự án (`project_id NOT NULL`), và chỉ requirement đã approve của dự án được chọn mới vào SRS của dự án đó.
 
@@ -350,7 +351,7 @@ uv run python -c "import app; print(app.generate_approved_srs('PRJ-…'))"      
 
 ## 7. Dữ liệu và quyền riêng tư
 
-- **Các thư mục chứa dữ liệu thật đều được `.gitignore` bỏ qua:** `src/input/` (tài liệu nguồn), `src/data/` (DB chứa nguyên văn passage), `src/output/` (SRS chứa trích dẫn nguyên văn), và `src/.env`. Đừng thêm dữ liệu thật vào file được git track, kể cả ví dụ trong tài liệu.
+- **Các thư mục chứa dữ liệu thật đều được** `.gitignore` **bỏ qua:** `src/input/` (tài liệu nguồn), `src/data/` (DB chứa nguyên văn passage), `src/output/` (SRS chứa trích dẫn nguyên văn), và `src/.env`. Đừng thêm dữ liệu thật vào file được git track, kể cả ví dụ trong tài liệu.
 - **Nội dung tài liệu được gửi tới Gemini API của Google** ở bước 1 (cả file), bước 2 và bước 5 (các passage). Chỉ dùng với tài liệu được phép gửi cho bên thứ ba.
 
 ---
@@ -359,6 +360,6 @@ uv run python -c "import app; print(app.generate_approved_srs('PRJ-…'))"      
 
 - **Kết quả của model dao động giữa các lần chạy.** Bước review ở bước 4 là nơi bắt các requirement bị gộp, sót hoặc gần trùng. Chống trùng chỉ bắt câu giống hệt nhau.
 - **Phần văn xuôi và các cặp stimulus/response trong SRS do model viết.** Code bảo đảm chúng liên kết đúng requirement và trích nguồn có thật, nhưng vẫn cần người đọc lại trước khi gửi khách.
-- **Mỗi tài liệu được xử lý trong một lần gọi model.** Tài liệu rất dài có thể gây `MAX_TOKENS`.
-- **Generator chưa lưu SRS vào `srs_runs`**, và chưa có lệnh CLI riêng cho bước 3.
-- **Thư mục `src/test/` chưa có test tự động.**
+- **Mỗi tài liệu được xử lý trong một lần gọi model.** Tài liệu rất dài có thể gây `MAX_TOKENS` 65.536k with `thinking`.
+- **Generator chưa lưu SRS vào** `srs_runs`, và chưa có lệnh CLI riêng cho bước 3.
+- **Thư mục** `src/test/` **chưa có test tự động.**
