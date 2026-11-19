@@ -126,6 +126,7 @@ class Requirement(RequirementDraft):
 
     id: Text
     status: RequirementStatus = "pending"
+    project_id: Text  # every stored requirement belongs to a project
     created_at: str | None = None  # ISO 8601 UTC, set by the database
     updated_at: str | None = None
 

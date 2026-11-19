@@ -1,8 +1,12 @@
 """Requirement registry: store reviewed-to-be requirements and gate approval.
 
-    save_candidates(drafts)  -> stored as "pending" with ids RQ-0001, RQ-0002, ...
-    approve(id) / reject(id) -> human review decisions
-    get_approved()           -> what the SRS generator may use
+    save_candidates(drafts, project_id=...) -> stored as "pending" with ids RQ-0001, ...
+    approve(id) / reject(id)                -> human review decisions
+    get_approved(project_id=...)            -> what the SRS generator may use
+
+Projects: every saved requirement belongs to the project it is saved for, and
+may only cite passages of that project's documents. Duplicate detection is
+per project (two projects may share a statement). One SRS = one project.
 
 Approval rule: a requirement is approved ONLY by an explicit approve() call,
 and approve() refuses unless its stored evidence is valid at that moment
@@ -19,7 +23,7 @@ positional SRS ids (REQ-1.1 / NF-2.1), and do not encode FR/NFR because the
 type can be edited.
 
 Command line (from src/):
-    python -m services.requirement_registry list [pending|approved|rejected]
+    python -m services.requirement_registry list [pending|approved|rejected] [--project PRJ-x]
     python -m services.requirement_registry show RQ-0001
     python -m services.requirement_registry approve RQ-0001 [RQ-0002 ...]
     python -m services.requirement_registry reject RQ-0003 [...]
@@ -57,18 +61,37 @@ class SaveResult:
 
 
 def save_candidates(
-    candidates: Iterable[RequirementDraft | Mapping[str, Any]], *, repo: SQLiteRepository | None = None
+    candidates: Iterable[RequirementDraft | Mapping[str, Any]],
+    *,
+    project_id: str,
+    repo: SQLiteRepository | None = None,
 ) -> SaveResult:
-    """Store candidates as "pending" with new RQ- ids, all or nothing.
+    """Store candidates of one project as "pending" with new RQ- ids, all or nothing.
 
+    - The project must exist, and every candidate may only cite passages of
+      the project's documents; otherwise RegistryError, nothing stored.
     - Every candidate must have valid evidence (run evidence_validator.validate
       first); otherwise RegistryError is raised and nothing is stored.
-    - A candidate whose statement already exists (any status; case and
-      whitespace ignored) or repeats within the batch is skipped and reported.
-      Reworded duplicates are NOT detected.
+    - A candidate whose statement already exists in the SAME project (any
+      status; case and whitespace ignored) or repeats within the batch is
+      skipped and reported. Reworded duplicates are NOT detected.
     """
     drafts = [_as_draft(c) for c in candidates]
     with _repo(repo) as r:
+        project = _get_project(r, project_id)
+        linked = set(project["document_ids"])
+        outside = []
+        for d in drafts:
+            docs = {p["document_id"] for p in r.get_passages([e.passage_id for e in d.evidence])}
+            if extra := sorted(docs - linked):
+                outside.append((d.statement, extra))
+        if outside:
+            details = "; ".join(f"{s[:60]!r} cites {', '.join(docs)}" for s, docs in outside[:3])
+            raise RegistryError(
+                f"{len(outside)} candidate(s) cite documents outside project {project_id}, "
+                f"nothing was saved: {details}. Link the documents to the project first "
+                "(python -m services.project_registry link) if they belong to it"
+            )
         invalid = [
             (d.statement, problems)
             for d in drafts
@@ -81,7 +104,10 @@ def save_candidates(
                 f"(validate with evidence_validator first): {details}"
             )
 
-        existing = {_statement_key(row["statement"]): row["id"] for row in r.list_requirements()}
+        existing = {
+            _statement_key(row["statement"]): row["id"]
+            for row in r.list_requirements(project_id=project_id)
+        }
         result = SaveResult()
         rows, batch_keys = [], set()
         for d in drafts:
@@ -92,10 +118,14 @@ def save_candidates(
                 result.duplicates.append((d.statement, "(same batch)"))
             else:
                 batch_keys.add(key)
-                rows.append({**d.model_dump(), "status": "pending"})  # never approved here
-        result.saved_ids = r.add_requirements_with_sequential_ids(
-            rows, prefix=ID_PREFIX, width=ID_WIDTH
-        )
+                # never approved here
+                rows.append({**d.model_dump(), "status": "pending", "project_id": project_id})
+        try:
+            result.saved_ids = r.add_requirements_with_sequential_ids(
+                rows, prefix=ID_PREFIX, width=ID_WIDTH
+            )
+        except RepositoryError as e:  # the repository re-checks project scope
+            raise RegistryError(f"Nothing was saved: {e}") from e
     logger.info("saved %d requirement(s) as pending, %d duplicate(s) skipped",
                 len(result.saved_ids), len(result.duplicates))
     return result
@@ -141,15 +171,18 @@ def get(requirement_id: str, *, repo: SQLiteRepository | None = None) -> dict[st
 
 
 def list_by_status(
-    status: str | None = None, *, repo: SQLiteRepository | None = None
+    status: str | None = None,
+    *,
+    project_id: str | None = None,
+    repo: SQLiteRepository | None = None,
 ) -> list[dict[str, Any]]:
-    """Stored rows, optionally filtered by status, in creation order."""
+    """Stored rows, optionally filtered by status and project, in creation order."""
     with _repo(repo) as r:
-        return r.list_requirements(status)
+        return r.list_requirements(status, project_id=project_id)
 
 
-def get_approved(*, repo: SQLiteRepository | None = None) -> list[Requirement]:
-    """Approved requirements for the SRS (app.py step 5).
+def get_approved(*, project_id: str, repo: SQLiteRepository | None = None) -> list[Requirement]:
+    """Approved requirements of ONE project for its SRS (app.py step 5).
 
     Evidence is re-checked as a last line of defence: the repository blocks
     every API path to an approved requirement with invalid evidence, but raw
@@ -158,7 +191,8 @@ def get_approved(*, repo: SQLiteRepository | None = None) -> list[Requirement]:
     raised instead of silently building an SRS on it.
     """
     with _repo(repo) as r:
-        rows = r.get_approved_requirements()
+        _get_project(r, project_id)
+        rows = r.get_approved_requirements(project_id)
         bad = [(row["id"], p) for row in rows if (p := evidence_validator.evidence_problems(row, r))]
         if bad:
             details = "; ".join(f"{rid}: {', '.join(p)}" for rid, p in bad)
@@ -182,6 +216,15 @@ def _get(repo: SQLiteRepository, requirement_id: str) -> dict[str, Any]:
     return row
 
 
+def _get_project(repo: SQLiteRepository, project_id: str) -> dict[str, Any]:
+    project = repo.get_project(project_id) if project_id else None
+    if project is None:
+        raise RegistryError(
+            f"Project {project_id!r} not found (python -m services.project_registry list)"
+        )
+    return project
+
+
 def _as_draft(candidate: RequirementDraft | Mapping[str, Any]) -> RequirementDraft:
     return evidence_validator.as_draft(candidate)
 
@@ -194,18 +237,30 @@ def _statement_key(statement: str) -> str:
 
 
 def _main(argv: list[str]) -> int:
-    usage = "usage: python -m services.requirement_registry list [STATUS] | show ID | approve ID... | reject ID..."
+    usage = ("usage: python -m services.requirement_registry "
+             "list [STATUS] [--project ID] | show ID | approve ID... | reject ID...")
     if not argv:
         print(usage)
         return 2
     command, args = argv[0], argv[1:]
+    project_id = None
+    if command == "list" and "--project" in args:
+        i = args.index("--project")
+        if i + 1 >= len(args):
+            print(usage)
+            return 2
+        project_id = args[i + 1]
+        args = args[:i] + args[i + 2:]
     try:
         if command == "list" and len(args) <= 1:
             with _repo(None) as r:
-                for row in r.list_requirements(args[0] if args else None):
+                if project_id is not None:
+                    _get_project(r, project_id)
+                for row in r.list_requirements(args[0] if args else None, project_id=project_id):
                     where = row["feature"] or row["nfr_category"]
                     flag = "" if not evidence_validator.evidence_problems(row, r) else "  [INVALID EVIDENCE]"
-                    print(f"{row['id']}  {row['status']:<8} {row['type'][:3].upper()} "
+                    owner = "" if project_id else f" {row['project_id']}"
+                    print(f"{row['id']}{owner}  {row['status']:<8} {row['type'][:3].upper()} "
                           f"{row['priority']:<6} [{where}] {row['statement']}{flag}")
             return 0
         if command == "show" and len(args) == 1:
@@ -213,7 +268,7 @@ def _main(argv: list[str]) -> int:
                 row = _get(r, args[0])
                 problems = evidence_validator.evidence_problems(row, r)
                 texts = {p["id"]: p["text"] for p in r.get_passages([e["passage_id"] for e in row["evidence"]])}
-            for key in ("id", "status", "type", "priority", "feature", "nfr_category", "statement",
+            for key in ("id", "project_id", "status", "type", "priority", "feature", "nfr_category", "statement",
                         "stimulus_or_condition", "response", "verification_method", "acceptance_measure"):
                 if row.get(key) is not None:
                     print(f"{key:<22} {row[key]}")

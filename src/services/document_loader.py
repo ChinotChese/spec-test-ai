@@ -16,13 +16,18 @@ Pipeline per file:
   4. Assign deterministic ids and save document + passages in one transaction:
        document  DOC-<first 12 hex of sha256>
        passage   <document id>-P0001, -P0002, ... in reading order
+     and link the document to the project, in the same transaction.
+
+Every ingest is for one project (services.project_registry), which must exist
+before any model call. A file already stored (same hash) is not re-read; it is
+only linked to the project, so one file can serve several projects.
 
 Usage:
     from services import document_loader
-    passages = document_loader.ingest()            # every supported file in src/input
-    passages = document_loader.ingest(["a.pdf"])   # specific files
+    passages = document_loader.ingest(project_id="PRJ-...")            # every file in src/input
+    passages = document_loader.ingest(["a.pdf"], project_id="PRJ-...") # specific files
 
-    uv run python -m services.document_loader [files...]  # from src/, prints a report
+    uv run python -m services.document_loader --project PRJ-... [files...]  # from src/, prints a report
 """
 
 from __future__ import annotations
@@ -116,21 +121,23 @@ class IngestResult:
 def ingest(
     files: Iterable[str | Path] | None = None,
     *,
+    project_id: str,
     repo: SQLiteRepository | None = None,
     client: Any = None,
     model: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Ingest files (default: every supported file in config.INPUT_DIR).
+    """Ingest files (default: every supported file in config.INPUT_DIR) for a project.
 
     Returns the stored passages of all files, in file then reading order.
     """
-    results = ingest_with_report(files, repo=repo, client=client, model=model)
+    results = ingest_with_report(files, project_id=project_id, repo=repo, client=client, model=model)
     return [p for r in results for p in r.passages]
 
 
 def ingest_with_report(
     files: Iterable[str | Path] | None = None,
     *,
+    project_id: str,
     repo: SQLiteRepository | None = None,
     client: Any = None,
     model: str | None = None,
@@ -139,15 +146,24 @@ def ingest_with_report(
     own_repo = repo is None
     repo = repo or SQLiteRepository(config.DB_PATH)
     try:
+        _require_project(repo, project_id)  # before any model call
         results = []
         for path in paths:
-            result = ingest_file(path, repo=repo, client=client, model=model)
+            result = ingest_file(path, project_id=project_id, repo=repo, client=client, model=model)
             _log_result(result)
             results.append(result)
         return results
     finally:
         if own_repo:
             repo.close()
+
+
+def _require_project(repo: SQLiteRepository, project_id: str) -> None:
+    if not project_id or repo.get_project(project_id) is None:
+        raise DocumentLoaderError(
+            f"Project {project_id!r} not found; create one with: "
+            "python -m services.project_registry create NAME"
+        )
 
 
 def discover_files(directory: str | Path) -> list[Path]:
@@ -169,10 +185,12 @@ def discover_files(directory: str | Path) -> list[Path]:
 def ingest_file(
     path: str | Path,
     *,
+    project_id: str,
     repo: SQLiteRepository,
     client: Any = None,
     model: str | None = None,
 ) -> IngestResult:
+    _require_project(repo, project_id)
     path = Path(path).resolve()
     kind = SUPPORTED_EXTENSIONS.get(path.suffix.lower())
     if kind is None:
@@ -191,6 +209,7 @@ def ingest_file(
     if existing is not None:
         stored = repo.list_passages(existing["id"])
         if stored:
+            repo.link_document(project_id, existing["id"])  # no-op if already linked
             return IngestResult(path.name, existing["id"], stored, skipped=True)
         document_id = existing["id"]  # stored earlier without passages: fill it in
 
@@ -210,6 +229,7 @@ def ingest_file(
         file_hash=file_hash,
         file_path=_display_path(path),
         passages=passages,
+        project_id=project_id,
     )
     return IngestResult(
         filename=path.name,
@@ -438,8 +458,15 @@ if __name__ == "__main__":
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="python -m services.document_loader",
+                                     description="Ingest source documents for a project.")
+    parser.add_argument("--project", required=True, help="project id (services.project_registry)")
+    parser.add_argument("files", nargs="*", help=f"default: every supported file in {config.INPUT_DIR}")
+    args = parser.parse_args()
     try:
-        ingest_with_report(sys.argv[1:] or None)
+        ingest_with_report(args.files or None, project_id=args.project)
     except DocumentLoaderError as e:
         logger.error("%s", e)
         sys.exit(1)

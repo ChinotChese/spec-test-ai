@@ -135,6 +135,7 @@ Requirement đã lưu. Gồm mọi field của `RequirementDraft`, cộng thêm:
 |---|---|---|---|
 | `id` | `Text` | | Id trong database, ví dụ `REQ-001` hoặc uuid. **Không phải** id vị trí trong SRS |
 | `status` | `pending` \| `approved` \| `rejected` | `pending` | Chỉ requirement `approved` mới được đưa vào SRS |
+| `project_id` | `Text` | (bắt buộc) | Dự án sở hữu requirement ([database/spec.md](../database/spec.md) mục 2.9). Không có trong `RequirementDraft` |
 | `created_at` | `str \| None` | `None` | ISO 8601 UTC, do database sinh |
 | `updated_at` | `str \| None` | `None` | |
 
@@ -149,7 +150,7 @@ from database.sqlite_repository import SQLiteRepository
 from schemas.requirement import RequirementDraft, Requirement
 
 draft = RequirementDraft.model_validate(llm_output)        # extractor
-rid = repo.add_requirement(**draft.model_dump())           # lưu
+rid = repo.add_requirement(**draft.model_dump(), project_id="PRJ-...")  # lưu (dự án bắt buộc)
 req = Requirement.model_validate(repo.get_requirement(rid))  # đọc lại
 ```
 

@@ -1,13 +1,20 @@
--- SpecTestAI SQLite schema
+-- 001: baseline schema (the former database/schema.sql, phase 1)
 --
 -- DOCUMENTS        ||--o{ SOURCE_PASSAGES : contains
 -- SOURCE_PASSAGES  }o--o{ REQUIREMENTS    : supports      (junction: requirement_evidence)
 -- REQUIREMENTS     }o--o{ SRS_RUNS        : included_in   (junction: srs_run_requirements)
 --
+-- Applied migrations must never be edited: database.migrate stores a checksum
+-- of every applied file and refuses to run when one has changed. Change the
+-- schema by adding the next NNN_name.sql file instead.
+--
+-- A database created before the migration framework existed has exactly this
+-- layout; `python -m database.migrate up` stamps it as version 1 without
+-- running this file again.
+--
 -- Foreign keys are only enforced when each connection runs PRAGMA foreign_keys = ON
--- (the repository does this).
-
-PRAGMA foreign_keys = ON;
+-- (the repository does this). Migrations run with them OFF and finish with
+-- PRAGMA foreign_key_check, so no PRAGMA belongs in a migration file.
 
 CREATE TABLE IF NOT EXISTS documents (
     id          TEXT PRIMARY KEY,

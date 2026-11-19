@@ -4,7 +4,8 @@
 
 | File | Bước trong `app.py` | Trạng thái |
 |---|---|---|
-| [document_loader.py](document_loader.py) | 1. Đọc tài liệu, lưu passage | ✔ Đã triển khai |
+| [project_registry.py](project_registry.py) | 0. Tạo / đổi tên dự án, liên kết tài liệu (mục 5) | ✔ Đã triển khai |
+| [document_loader.py](document_loader.py) | 1. Đọc tài liệu, lưu passage, liên kết với dự án | ✔ Đã triển khai |
 | [evidence_validator.py](evidence_validator.py) | 3. Kiểm tra evidence (quote có thật trong passage) | ✔ Đã triển khai |
 | [requirement_registry.py](requirement_registry.py) | 3–5. Cấp id, lưu requirement chờ duyệt, approve/reject, lấy requirement đã duyệt | ✔ Đã triển khai |
 | [srs_validator.py](srs_validator.py) | 7. Kiểm tra SRS và dò nguồn gốc từng FR/NFR trước khi export | ✔ Đã triển khai |
@@ -118,9 +119,9 @@ from services import document_loader
 
 | Hàm | Mô tả |
 |---|---|
-| `ingest(files=None, *, repo=None, client=None, model=None) -> list[dict]` | Ingest các file, mặc định là mọi file hỗ trợ trong `config.INPUT_DIR`. Trả về passage của tất cả file, theo thứ tự file rồi thứ tự đọc. Đây là hàm `app.py` gọi |
+| `ingest(files=None, *, project_id, repo=None, client=None, model=None) -> list[dict]` | Ingest các file cho một dự án (**`project_id` bắt buộc**, phải tồn tại), mặc định là mọi file hỗ trợ trong `config.INPUT_DIR`. Mỗi tài liệu được liên kết với dự án. Trả về passage của tất cả file, theo thứ tự file rồi thứ tự đọc. Đây là hàm `app.py` gọi |
 | `ingest_with_report(...) -> list[IngestResult]` | Như trên nhưng trả báo cáo cho từng file và ghi log |
-| `ingest_file(path, *, repo, client=None, model=None) -> IngestResult` | Ingest một file |
+| `ingest_file(path, *, project_id, repo, client=None, model=None) -> IngestResult` | Ingest một file cho một dự án |
 | `discover_files(directory) -> list[Path]` | Các file hỗ trợ nằm trực tiếp trong thư mục (không đệ quy), sắp theo tên |
 
 Tham số:
@@ -204,10 +205,13 @@ Thư viện cần có: `google-genai`, `pydantic`, `pdfplumber` (để kiểm tr
 Chạy từ `src/`:
 
 ```bash
-uv run python -m database.init_db                 # lần đầu: tạo DB
-uv run python -m services.document_loader         # mọi file trong src/input
-uv run python -m services.document_loader a.pdf   # file cụ thể
+uv run python -m database.init_db                                   # lần đầu: tạo DB
+uv run python -m services.project_registry create "Tên dự án"       # in ra PRJ-…
+uv run python -m services.document_loader --project PRJ-…           # mọi file trong src/input
+uv run python -m services.document_loader --project PRJ-… a.pdf     # file cụ thể
 ```
+
+`--project` là bắt buộc, và project phải tồn tại (kiểm tra **trước** khi gọi Gemini). Tài liệu mới được liên kết với dự án trong cùng transaction lưu passage. File đã ingest (cùng hash) không gọi Gemini lại mà chỉ được liên kết thêm vào dự án, nên một file dùng được cho nhiều dự án.
 
 Output (lần chạy thật với 2 file trong `src/input`):
 
@@ -244,7 +248,8 @@ class FakeGemini:
                   candidates=[NS(finish_reason=NS(name=self._reason))])
 
 repo = SQLiteRepository(":memory:")
-result = document_loader.ingest_file("notes.txt", repo=repo, client=FakeGemini([
+prj = repo.add_project("Test", project_id="PRJ-test")
+result = document_loader.ingest_file("notes.txt", project_id=prj, repo=repo, client=FakeGemini([
     {"page": None, "text": "The system shall export reports to PDF."},
 ]))
 ```
@@ -340,7 +345,7 @@ Quá trình cấp số giả định chỉ có một tiến trình ghi vào DB (
 
 `save_candidates()` bỏ qua candidate có `statement` trùng (bỏ qua hoa thường và khoảng trắng) với:
 
-- một requirement đã lưu, **ở mọi status**: requirement đã từng bị reject sẽ không quay lại qua lần trích xuất sau;
+- một requirement đã lưu **của cùng dự án**, **ở mọi status**: requirement đã từng bị reject sẽ không quay lại qua lần trích xuất sau. Hai dự án khác nhau được phép có câu giống nhau;
 - một candidate trước đó trong cùng lô.
 
 Candidate bị bỏ qua được trả trong `SaveResult.duplicates` dưới dạng `(statement, id đã có)`. **Câu cùng ý nhưng diễn đạt khác không bị phát hiện**, nên chạy lại extractor (vốn cho kết quả dao động) vẫn có thể thêm bản gần trùng. Người review cần reject các bản này.
@@ -353,12 +358,12 @@ from services import requirement_registry
 
 | Hàm | Trả về | Mô tả |
 |---|---|---|
-| `save_candidates(candidates, *, repo=None)` | `SaveResult` (`saved_ids`, `duplicates`) | Lưu `pending`, cấp id, all-or-nothing. **Raise `RegistryError` và không lưu gì** nếu có candidate có evidence không hợp lệ: hãy lọc bằng `evidence_validator.validate()` trước |
+| `save_candidates(candidates, *, project_id, repo=None)` | `SaveResult` (`saved_ids`, `duplicates`) | Lưu `pending` vào dự án (**`project_id` bắt buộc**), cấp id, all-or-nothing. **Raise `RegistryError` và không lưu gì** nếu dự án không tồn tại, nếu có candidate trích passage của tài liệu ngoài dự án, hoặc nếu có candidate có evidence không hợp lệ (hãy lọc bằng `evidence_validator.validate()` trước) |
 | `approve(id, *, repo=None)` | `Requirement` | Kiểm tra evidence rồi approve. Lỗi thì `RegistryError`, status giữ nguyên |
 | `reject(id, *, repo=None)` | dict (dòng repository) | Reject, không cần kiểm tra evidence |
 | `get(id, *, repo=None)` | dict | Một dòng, kèm `evidence`. `RegistryError` nếu không tồn tại |
-| `list_by_status(status=None, *, repo=None)` | `list[dict]` | Các dòng theo status, theo thứ tự tạo |
-| `get_approved(*, repo=None)` | `list[Requirement]` | Requirement đã approve, có kiểm tra lại evidence (mục 3.1). Đây là hàm `app.py` gọi ở bước 5 |
+| `list_by_status(status=None, *, project_id=None, repo=None)` | `list[dict]` | Các dòng theo status (và dự án), theo thứ tự tạo |
+| `get_approved(*, project_id, repo=None)` | `list[Requirement]` | Requirement đã approve **của một dự án**, có kiểm tra lại evidence (mục 3.1). Đây là hàm `app.py` gọi ở bước 5 |
 
 `get`, `list_by_status` và `reject` trả dict thô thay vì `Requirement`, vì một dòng trong DB có thể hỏng (ví dụ không có evidence sau khi chèn thẳng bằng SQL), và người review vẫn phải xem được và reject được dòng đó. `approve` và `get_approved` trả `Requirement`, vì evidence của chúng đã được kiểm tra.
 
@@ -367,13 +372,13 @@ from services import requirement_registry
 Chạy từ `src/`:
 
 ```bash
-uv run python -m services.requirement_registry list [pending|approved|rejected]
+uv run python -m services.requirement_registry list [pending|approved|rejected] [--project PRJ-…]
 uv run python -m services.requirement_registry show RQ-0024
 uv run python -m services.requirement_registry approve RQ-0013 RQ-0014
 uv run python -m services.requirement_registry reject RQ-0020
 ```
 
-- `list`: mỗi requirement một dòng; requirement có evidence không hợp lệ được đánh dấu `[INVALID EVIDENCE]`.
+- `list`: mỗi requirement một dòng; requirement có evidence không hợp lệ được đánh dấu `[INVALID EVIDENCE]`. Không có `--project` thì mỗi dòng in thêm dự án của requirement.
 - `show`: in mọi field, từng quote **kèm text của passage gốc** để người review đối chiếu, và kết quả kiểm tra evidence.
 - `approve` / `reject`: xử lý từng id. Lỗi của một id không làm dừng các id còn lại. Exit code là 1 nếu có id lỗi.
 
@@ -428,7 +433,7 @@ Ngoài ra, SRS được validate lại bằng `schemas.srs.SRS`, để bắt c�
 |---|---|
 | Placeholder còn sót, ví dụ `<Project Name>` | `app.py` không truyền tên dự án, nên nếu coi đây là lỗi thì đường mặc định không bao giờ xuất được. Địa chỉ email kiểu `<a@b.de>` không bị coi là placeholder |
 | Mục văn xuôi `unresolved` / `not_applicable`, nhóm NFR không có requirement | Đây là cách tài liệu nói thật rằng nguồn không đề cập |
-| Requirement đã approve trong `requirements` nhưng không có trong SRS | Một DB có thể chứa nhiều dự án (mục 2.9 của [agents/spec.md](../agents/spec.md)) |
+| Requirement đã approve trong `requirements` nhưng không có trong SRS | Người gọi có thể cố ý chỉ dùng một phần requirement của dự án |
 
 ### 4.3 API
 
@@ -438,7 +443,7 @@ from services import srs_validator
 
 | Hàm | Mô tả |
 |---|---|
-| `validate(srs, requirements=None, *, requirement_map=None, repo=None) -> SrsValidationReport` | Kiểm tra; có lỗi thì raise `SrsValidationError` (`.errors`, `.report`). Đây là hàm `app.py` gọi |
+| `validate(srs, requirements=None, *, requirement_map=None, project_id=None, repo=None) -> SrsValidationReport` | Kiểm tra; có lỗi thì raise `SrsValidationError` (`.errors`, `.report`). Đây là hàm `app.py` gọi |
 | `check(...)` | Như trên nhưng trả báo cáo, không raise |
 
 `SrsValidationReport`:
@@ -446,13 +451,34 @@ from services import srs_validator
 | Field | Ý nghĩa |
 |---|---|
 | `srs` | SRS đã validate lại |
+| `project_id` | Dự án của SRS |
 | `trace` | `list[TraceEntry]`: mỗi FR/NFR có `srs_id`, `registry_id`, loại, statement, priority, và `evidence` (passage id, tài liệu, tên file, trang, quote đã lưu, nguyên văn passage) |
 | `requirement_map` | `{srs_id: registry_id}` dò được |
 | `errors`, `warnings`, `ok` | |
 | `passages`, `documents` | Mọi passage được trích và tài liệu của chúng (exporter dùng cho Appendix B) |
 
-`requirements` chỉ dùng để cảnh báo về requirement bị bỏ sót. Nguồn gốc luôn được dò trong **mọi** requirement đã approve của registry.
+**Một SRS = một dự án.** Dự án là `project_id`, hoặc (khi không truyền) dự án chung của các id trong `requirements` / `requirement_map`. Không xác định được dự án, hoặc đầu vào trải trên nhiều dự án, thì đó là lỗi, và validator dừng trước bước dò nguồn gốc. Nguồn gốc được dò trong **mọi** requirement đã approve **của dự án đó**, nên hai dự án có câu giống nhau không làm lỗi "matches several approved requirements". `requirements` còn dùng để cảnh báo về requirement bị bỏ sót.
 
 ### 4.4 Test
 
-Xem [exporters/spec.md](../exporters/spec.md) mục 1.9. Trên SRS thật (27 FR), validator dò được nguồn gốc của cả 27/27 requirement, không có lỗi, và có 5 warning.
+Xem [exporters/spec.md](../exporters/spec.md) mục 1.9. Trên SRS thật (27 FR), validator dò được nguồn gốc của cả 27/27 requirement, không có lỗi, và có 5 warning. Phần theo dự án được test bằng `test/test_project_pipeline.py` (không gọi Gemini).
+
+---
+
+## 5. `project_registry.py`
+
+Tạo và quản lý dự án. Mọi requirement và SRS run thuộc về một dự án, và requirement chỉ được trích passage của tài liệu thuộc dự án đó ([database/spec.md](../database/spec.md) mục 3.2).
+
+```bash
+uv run python -m services.project_registry list                                # dự án, tài liệu, số requirement / SRS run
+uv run python -m services.project_registry create NAME [--id PRJ-x] [--description TEXT]
+uv run python -m services.project_registry rename PRJ-x NEW_NAME
+uv run python -m services.project_registry link PRJ-x DOC-…                    # thêm tài liệu đã lưu
+uv run python -m services.project_registry unlink PRJ-x DOC-…                  # bị chặn nếu đang được trích
+uv run python -m services.project_registry delete PRJ-x                        # bị chặn nếu còn requirement / SRS run
+```
+
+| Hàm | Mô tả |
+|---|---|
+| `create(name, *, description=None, document_ids=(), project_id=None, repo=None) -> str` | Tạo dự án; id mặc định `PRJ-<12 hex>`. Tên phải duy nhất và không rỗng. Lỗi thì `ProjectError` |
+| `require(project_id, *, repo=None) -> dict` | Dòng project, hoặc `ProjectError` nếu không tồn tại |

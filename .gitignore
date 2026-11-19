@@ -234,5 +234,6 @@ src/data/
 *.db-journal
 *.db-wal
 *.db-shm
+*.db.bak-*
 src/input/
 src/output/

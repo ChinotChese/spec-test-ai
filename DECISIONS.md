@@ -83,6 +83,5 @@ Tóm tắt các lựa chọn chính khi xây dựng hệ thống, theo thứ t�
 
 ## Còn để ngỏ
 
-- **Chưa có khái niệm "dự án"** trong DB. Một SRS dùng mọi requirement đã approve.
-- **Chống trùng chỉ bắt câu giống hệt nhau.** Requirement diễn đạt khác vẫn cần người review loại bỏ.
-- **Chưa lưu SRS vào `srs_runs`**; chưa có test tự động trong repo.
+- **Chống trùng chỉ bắt câu giống hệt nhau** (trong cùng dự án). Requirement diễn đạt khác vẫn cần người review loại bỏ.
+- **Chưa lưu SRS vào `srs_runs`**. Test tự động (`src/test`, unittest) mới phủ migration, dự án và các quy tắc phạm vi dự án.

@@ -53,7 +53,7 @@ flowchart LR
 
 ```
 src/
-├── app.py                 Hai hàm pipeline: generate_srs_pipeline(), generate_approved_srs()
+├── app.py                 Hai hàm pipeline (theo dự án): generate_srs_pipeline(), generate_approved_srs()
 ├── config.py              Đường dẫn, tên model, retry; đọc src/.env
 ├── agents/                Bước dùng LLM để suy luận nội dung
 │   ├── requirement_extractor.py
@@ -65,12 +65,13 @@ src/
 ├── services/              Đọc, kiểm tra, lưu dữ liệu (không suy luận nội dung)
 │   ├── document_loader.py
 │   ├── evidence_validator.py
+│   ├── project_registry.py    Tạo / đổi tên dự án, liên kết tài liệu
 │   ├── requirement_registry.py
 │   └── srs_validator.py
 ├── exporters/
 │   └── markdown.py
 ├── schemas/               Model Pydantic: RequirementDraft / Requirement, SRS (IEEE 830)
-├── database/              SQLite: schema.sql, repository, init_db, evidence_rules
+├── database/              SQLite: migrations/, migrate, repository, init_db, evidence_rules
 ├── templates/             IEEE_830_SRS_Template.md, standard_srs.yaml
 ├── input/                 Tài liệu nguồn            (gitignored)
 ├── data/                  spectest.db               (gitignored)
@@ -173,16 +174,36 @@ Database created: .../src/data/spectest.db
 Schema OK
 ```
 
-Lệnh tạo `src/data/spectest.db` nếu chưa có, và kiểm tra DB hiện có còn khớp `database/schema.sql` không. Dự án chưa có cơ chế migration: khi schema đổi, chạy `--reset` (lệnh này **xóa toàn bộ dữ liệu**).
+Lệnh tạo `src/data/spectest.db` nếu chưa có (chạy toàn bộ `database/migrations/*.sql`), và kiểm tra DB hiện có đã ở phiên bản schema mới nhất chưa. Nếu DB cũ hơn code, **không cần xóa dữ liệu**: chạy
+
+```bash
+uv run python -m database.migrate up                 # backup file DB, rồi chạy các migration còn thiếu
+```
+
+Chi tiết: [database/spec.md](src/database/spec.md) mục 7. `--reset` vẫn còn nhưng **xóa toàn bộ dữ liệu**.
+
+### Bước 0b. Tạo dự án
+
+Mỗi lần chạy pipeline là cho **một dự án**: tài liệu, requirement và SRS đều mang `project_id` của dự án đó.
+
+```bash
+uv run python -m services.project_registry create "Example Support Platform"   # in ra PRJ-…
+uv run python -m services.project_registry list                                # dự án, tài liệu, số requirement
+uv run python -m services.project_registry rename PRJ-… "Tên mới"
+```
+
+Các lệnh bên dưới dùng `PRJ-…` là id vừa tạo.
 
 ### Bước 1. Ingest tài liệu
 
 Đặt file vào `src/input/` (hỗ trợ `.pdf`, `.docx`, `.txt`, `.md`), rồi chạy:
 
 ```bash
-uv run python -m services.document_loader              # mọi file trong src/input
-uv run python -m services.document_loader path/a.pdf   # file cụ thể
+uv run python -m services.document_loader --project PRJ-…              # mọi file trong src/input
+uv run python -m services.document_loader --project PRJ-… path/a.pdf   # file cụ thể
 ```
+
+Tài liệu được liên kết với dự án trong cùng transaction với việc lưu passage. File đã ingest trước đó (cùng hash) không được đọc lại mà chỉ được liên kết thêm vào dự án, nên một file có thể dùng cho nhiều dự án.
 
 ```
 INFO proposal_a.pdf: DOC-1a2b3c4d5e6f, 98 passages, 0 rejected, 0 unverified, coverage 92%
@@ -195,8 +216,8 @@ INFO proposal_a.pdf: DOC-1a2b3c4d5e6f, 98 passages, 0 rejected, 0 unverified, co
 ### Bước 2. Xem thử requirement được trích (không lưu)
 
 ```bash
-uv run python -m agents.requirement_extractor                      # mọi tài liệu trong DB
-uv run python -m agents.requirement_extractor DOC-1a2b3c4d5e6f     # một tài liệu
+uv run python -m agents.requirement_extractor --project PRJ-…                     # mọi tài liệu của dự án
+uv run python -m agents.requirement_extractor --project PRJ-… DOC-1a2b3c4d5e6f    # một tài liệu của dự án
 ```
 
 ```
@@ -212,20 +233,20 @@ Bước này chỉ in kết quả ra màn hình. Mỗi tài liệu được gọ
 Chưa có lệnh CLI riêng cho bước này; dùng hàm pipeline trong `app.py`:
 
 ```bash
-uv run python -c "import logging; logging.basicConfig(level=logging.INFO, format='%(levelname)s %(message)s'); import app; app.generate_srs_pipeline(None)"
+uv run python -c "import logging; logging.basicConfig(level=logging.INFO, format='%(levelname)s %(message)s'); import app; app.generate_srs_pipeline(None, 'PRJ-…')"
 ```
 
 Hàm này chạy lại bước 1 (bỏ qua file đã ingest) và bước 2, rồi:
 
 1. `evidence_validator.validate()` loại các requirement có quote không nằm trong passage;
-2. `requirement_registry.save_candidates()` lưu phần còn lại với status `pending` và id `RQ-0001`, `RQ-0002`…
+2. `requirement_registry.save_candidates(..., project_id=...)` lưu phần còn lại vào dự án, với status `pending` và id `RQ-0001`, `RQ-0002`… Requirement trích passage của tài liệu **ngoài dự án** thì cả lô bị từ chối.
 
-Requirement có câu trùng với câu đã lưu (ở mọi status) sẽ không bị lưu lại.
+Requirement có câu trùng với câu đã lưu **trong cùng dự án** (ở mọi status) sẽ không bị lưu lại. Hai dự án khác nhau được phép có câu giống nhau.
 
 ### Bước 4. Review: approve / reject
 
 ```bash
-uv run python -m services.requirement_registry list pending
+uv run python -m services.requirement_registry list pending --project PRJ-…
 uv run python -m services.requirement_registry show RQ-0005
 uv run python -m services.requirement_registry approve RQ-0005 RQ-0006
 uv run python -m services.requirement_registry reject RQ-0007
@@ -235,13 +256,13 @@ uv run python -m services.requirement_registry reject RQ-0007
 - **`list`** đánh dấu `[INVALID EVIDENCE]` cho requirement không thể approve.
 - **`approve`** bị từ chối, và status giữ nguyên, nếu evidence không hợp lệ. Quy tắc này được thực thi ở cả tầng repository.
 
-> **Lưu ý:** registry chưa có khái niệm "dự án". Nếu `src/input` chứa tài liệu của nhiều dự án, **chỉ approve requirement của dự án cần sinh SRS**, vì bước 5 dùng mọi requirement đang `approved`.
+> **Lưu ý:** mỗi requirement thuộc đúng một dự án (`project_id NOT NULL`), và chỉ requirement đã approve của dự án được chọn mới vào SRS của dự án đó.
 
 ### Bước 5. Sinh SRS (JSON)
 
 ```bash
-uv run python -m agents.srs_generator \
-    --project "Example Support Platform" --org "ExampleCorp" --author "Alice Example" \
+uv run python -m agents.srs_generator --project-id PRJ-… \
+    --org "ExampleCorp" --author "Alice Example" \
     --out output/srs.json
 ```
 
@@ -249,15 +270,16 @@ uv run python -m agents.srs_generator \
 INFO SRS: 7 features, 27 requirements, documents DOC-1a2b3c4d5e6f, attempts 1
 ```
 
+- **Chỉ dùng requirement đã approve của dự án đó.** Một SRS = một dự án: generator từ chối (trước khi gọi model) bộ requirement trải trên nhiều dự án.
 - **Code dựng mục 3, 5, 6** từ requirement đã approve.
 - **Model viết phần văn xuôi** (mục 1, 2, 4), mô tả feature và các cặp stimulus/response. Mục nào nguồn không nói đủ thì để `unresolved`, không bịa.
-- **Tên dự án, tổ chức, tác giả** lấy từ tham số. Nếu thiếu, SRS giữ placeholder `<Project Name>`.
+- **Tên dự án** mặc định là tên trong bảng `projects` (đổi bằng `--project "Tên"`). **Tổ chức, tác giả** lấy từ tham số; nếu thiếu, SRS giữ placeholder `<Organization>` / `<Author>`.
 - **Kết quả được validate** bằng `schemas/srs.py`.
 
 ### Bước 6. Kiểm tra và xuất Markdown
 
 ```bash
-uv run python -m exporters.markdown output/srs.json
+uv run python -m exporters.markdown output/srs.json --project PRJ-…
 ```
 
 ```
@@ -279,12 +301,13 @@ Exporter gọi `srs_validator` trước, và **không ghi file nếu có lỗi**
 ## 4. Chạy nhanh bằng `app.py`
 
 ```bash
-uv run python -c "import app; app.generate_srs_pipeline(None)"         # bước 1–3
-uv run python -m services.requirement_registry approve RQ-0001 ...    # bước 4 (thủ công)
-uv run python -c "import app; print(app.generate_approved_srs())"     # bước 5–7, in đường dẫn file .md
+uv run python -m services.project_registry create "Example Support Platform"   # bước 0b, in ra PRJ-…
+uv run python -c "import app; app.generate_srs_pipeline(None, 'PRJ-…')"         # bước 1–3
+uv run python -m services.requirement_registry approve RQ-0001 ...             # bước 4 (thủ công)
+uv run python -c "import app; print(app.generate_approved_srs('PRJ-…'))"       # bước 5–7, in đường dẫn file .md
 ```
 
-`generate_approved_srs()` không truyền tên dự án, nên SRS sẽ có placeholder `<Project Name>`. Muốn có thông tin dự án, dùng lệnh CLI ở bước 5.
+`generate_approved_srs()` lấy tên dự án từ bảng `projects`. Tổ chức và tác giả vẫn là placeholder; muốn điền, dùng lệnh CLI ở bước 5.
 
 ---
 
@@ -312,7 +335,8 @@ uv run python -c "import app; print(app.generate_approved_srs())"     # bước 
 
 | Triệu chứng | Nguyên nhân / cách xử lý |
 |---|---|
-| `RepositoryError: … does not match schema.sql` | DB tạo từ schema cũ. Chạy `python -m database.init_db` để xem bảng hoặc cột lệch; `--reset` để tạo lại (xóa dữ liệu) |
+| `RepositoryError: … database is at version N but the code needs M` | DB cũ hơn code. Chạy `python -m database.migrate up` (tự backup trước, giữ nguyên dữ liệu) |
+| `RepositoryError: … no migration history and its tables do not match migration 001` | DB tạo từ một schema rất cũ (trước phase 1), không migrate được. Lấy ra dữ liệu cần giữ, rồi `python -m database.init_db --reset` |
 | `GEMINI_API_KEY is not set` | Thiếu key trong `src/.env` |
 | `Gemini HTTP 404 NOT_FOUND` | Sai tên model trong `GEMINI_MODEL_*` |
 | `Gemini daily quota exhausted (…)` | Hết quota trong ngày; chạy lại sau khi quota reset. File hoặc tài liệu đã xử lý xong sẽ được bỏ qua |
@@ -333,7 +357,6 @@ uv run python -c "import app; print(app.generate_approved_srs())"     # bước 
 
 ## 8. Giới hạn hiện tại
 
-- **Chưa có khái niệm dự án** trong DB. Bước 5 dùng mọi requirement đang `approved` (xem lưu ý ở bước 4).
 - **Kết quả của model dao động giữa các lần chạy.** Bước review ở bước 4 là nơi bắt các requirement bị gộp, sót hoặc gần trùng. Chống trùng chỉ bắt câu giống hệt nhau.
 - **Phần văn xuôi và các cặp stimulus/response trong SRS do model viết.** Code bảo đảm chúng liên kết đúng requirement và trích nguồn có thật, nhưng vẫn cần người đọc lại trước khi gửi khách.
 - **Mỗi tài liệu được xử lý trong một lần gọi model.** Tài liệu rất dài có thể gây `MAX_TOKENS`.
