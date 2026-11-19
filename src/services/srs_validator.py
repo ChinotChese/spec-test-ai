@@ -2,11 +2,17 @@
 
     report = srs_validator.validate(srs, requirements)      # app.py step 7
 
+An SRS belongs to ONE project: `project_id`, or the common project of the
+given `requirements` / `requirement_map`. Origins are looked up only among
+that project's approved requirements, so two projects may share a statement.
+A project that cannot be determined, or input spanning several projects, is
+an error.
+
 For every FR (REQ-n.m) and NFR (NF-n.m) in the SRS, the validator finds its
 origin in the registry and checks it, because the SRS schema has no room for
 registry ids:
-  1. exactly one APPROVED registry requirement has the same type and the exact
-     same statement (the generator copies statements verbatim);
+  1. exactly one APPROVED requirement of the project has the same type and
+     the exact same statement (the generator copies statements verbatim);
   2. its priority (and, for NFRs, category-independent fields
      verification_method / acceptance_measure) are equal;
   3. the SRS source_ids equal that requirement's evidence passage ids;
@@ -18,8 +24,7 @@ Errors make validate() raise SrsValidationError. Warnings do not:
   - leftover template placeholders such as "<Project Name>" (app.py passes no
     project name, so this cannot block the default path);
   - unresolved / not-applicable sections and NFR groups;
-  - approved requirements given in `requirements` that the SRS does not use
-    (one database can hold several projects, so this is not an error).
+  - approved requirements given in `requirements` that the SRS does not use.
 
 The returned report carries the trace (SRS id -> registry id -> passages,
 documents, pages, stored quotes) that exporters.markdown prints.
@@ -74,6 +79,7 @@ class TraceEntry:
 @dataclass
 class SrsValidationReport:
     srs: SRS
+    project_id: str | None = None                                       # the SRS's project
     trace: list[TraceEntry] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -97,10 +103,11 @@ def validate(
     requirements: Iterable[Requirement | Mapping[str, Any] | str] | None = None,
     *,
     requirement_map: Mapping[str, str] | None = None,
+    project_id: str | None = None,
     repo: SQLiteRepository | None = None,
 ) -> SrsValidationReport:
     """Validate and trace; raise SrsValidationError if anything is wrong."""
-    report = check(srs, requirements, requirement_map=requirement_map, repo=repo)
+    report = check(srs, requirements, requirement_map=requirement_map, project_id=project_id, repo=repo)
     if report.errors:
         raise SrsValidationError(report.errors, report)
     return report
@@ -111,14 +118,16 @@ def check(
     requirements: Iterable[Requirement | Mapping[str, Any] | str] | None = None,
     *,
     requirement_map: Mapping[str, str] | None = None,
+    project_id: str | None = None,
     repo: SQLiteRepository | None = None,
 ) -> SrsValidationReport:
     """Same checks as validate(), but returns the report instead of raising.
 
     `requirements`: the approved requirements the SRS is expected to come from
-    (app.py passes requirement_registry.get_approved()). Origins are looked up
-    among ALL approved registry rows; `requirements` is only used to warn
-    about approved requirements the SRS leaves out.
+    (app.py passes requirement_registry.get_approved(project_id=...)). Origins
+    are looked up among ALL approved rows of the SRS's project; `requirements`
+    also determines that project when `project_id` is not given, and is used to
+    warn about approved requirements the SRS leaves out.
     `requirement_map`: optional {SRS id: registry id} from the generator; when
     given, it must agree with the traced origins.
     """
@@ -130,7 +139,10 @@ def check(
     report = SrsValidationReport(doc)
 
     with using_repo(repo) as r:
-        approved = r.get_approved_requirements()
+        report.project_id = _resolve_project(r, project_id, requirements, requirement_map, report.errors)
+        if report.project_id is None:
+            return report  # tracing against an unknown project would only add noise
+        approved = r.get_approved_requirements(report.project_id)
         by_statement: dict[tuple[str, str], list[dict[str, Any]]] = {}
         for row in approved:
             by_statement.setdefault((row["type"], row["statement"]), []).append(row)
@@ -198,6 +210,35 @@ def _trace_one(srs_req, kind, by_statement, repo, errors) -> TraceEntry:
     return entry
 
 
+def _ids_of(requirements) -> list[str]:
+    return [r if isinstance(r, str) else (r.id if isinstance(r, Requirement) else r["id"])
+            for r in requirements or ()]
+
+
+def _resolve_project(repo, project_id, requirements, requirement_map, errors) -> str | None:
+    """The SRS's project: explicit, or the one project all given requirements share."""
+    given = list(dict.fromkeys(_ids_of(requirements) + list((requirement_map or {}).values())))
+    owners = {rid: (repo.get_requirement(rid) or {}).get("project_id") for rid in given}
+    if project_id is not None:
+        if repo.get_project(project_id) is None:
+            errors.append(f"project {project_id} does not exist")
+            return None
+        if foreign := [rid for rid, p in owners.items() if p != project_id]:
+            errors.append(f"requirements not in project {project_id}: {', '.join(foreign)}")
+        return project_id
+    if not given:
+        errors.append("cannot tell which project the SRS belongs to: pass project_id or requirements")
+        return None
+    if unknown := [rid for rid, p in owners.items() if p is None]:  # id not in the registry
+        errors.append(f"requirements not in the registry: {', '.join(unknown)}")
+        return None
+    projects = sorted(set(owners.values()))
+    if len(projects) > 1:
+        errors.append(f"requirements span several projects ({', '.join(projects)}); one SRS = one project")
+        return None
+    return projects[0]
+
+
 def _all_source_ids(doc: SRS) -> set[str]:
     return doc.source_ids()
 
@@ -216,9 +257,7 @@ def _check_map(report: SrsValidationReport, requirement_map: Mapping[str, str] |
 def _check_coverage(report: SrsValidationReport, requirements) -> None:
     if requirements is None:
         return
-    given = []
-    for r in requirements:
-        given.append(r if isinstance(r, str) else (r.id if isinstance(r, Requirement) else r["id"]))
+    given = _ids_of(requirements)
     used = set(report.requirement_map.values())
     missing = [rid for rid in dict.fromkeys(given) if rid not in used]
     if missing:
