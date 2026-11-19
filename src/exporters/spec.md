@@ -84,13 +84,15 @@ text = markdown.render(validation_report)            # chỉ dựng nội dung, 
 
 ### 1.7 Dòng lệnh
 
-Chạy từ `src/`. Lệnh dùng `requirement_registry.get_approved()` làm danh sách requirement:
+Chạy từ `src/`. Lệnh dùng `requirement_registry.get_approved(project_id=...)` làm danh sách requirement; `--project` (id dự án) là bắt buộc:
 
 ```bash
-uv run python -m agents.srs_generator --project "..." --org ... --author "..." --out output/srs.json
-uv run python -m exporters.markdown output/srs.json            # -> src/output/SRS_....md
-uv run python -m exporters.markdown srs.json --out-dir DIR --name SRS.md
+uv run python -m agents.srs_generator --project-id PRJ-… --org ... --author "..." --out output/srs.json
+uv run python -m exporters.markdown output/srs.json --project PRJ-…            # -> src/output/SRS_....md
+uv run python -m exporters.markdown srs.json --project PRJ-… --out-dir DIR --name SRS.md
 ```
+
+`export(..., project_id=None)` truyền `project_id` xuống `srs_validator`; nếu không truyền, dự án được suy ra từ `requirements` ([services/spec.md](../services/spec.md) mục 4.3).
 
 Thành công thì in đường dẫn file. Lỗi validation thì in từng lỗi và thoát với exit code 1, không ghi file.
 

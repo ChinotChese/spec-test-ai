@@ -18,7 +18,7 @@ work in any Markdown preview). All dynamic text is escaped: "<Project Name>"
 stays visible and "|" cannot break a table.
 
 Command line (from src/):
-    python -m exporters.markdown SRS.json [--out-dir DIR] [--name FILE.md]
+    python -m exporters.markdown SRS.json --project PRJ-x [--out-dir DIR] [--name FILE.md]
 """
 
 from __future__ import annotations
@@ -49,10 +49,17 @@ def export(
     requirement_map: Mapping[str, str] | None = None,
     out_dir: str | Path | None = None,
     filename: str | None = None,
+    project_id: str | None = None,
     repo: SQLiteRepository | None = None,
 ) -> Path:
-    """Validate, render and write the SRS; returns the path of the .md file."""
-    report = srs_validator.validate(srs, requirements, requirement_map=requirement_map, repo=repo)
+    """Validate, render and write the SRS; returns the path of the .md file.
+
+    project_id: the SRS's project; when None it is taken from `requirements`
+    (see services.srs_validator).
+    """
+    report = srs_validator.validate(
+        srs, requirements, requirement_map=requirement_map, project_id=project_id, repo=repo
+    )
     text = render(report)
     out_dir = Path(out_dir) if out_dir is not None else config.OUTPUT_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -341,6 +348,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description="Validate an SRS JSON file and export it to Markdown.")
     parser.add_argument("srs_json")
+    parser.add_argument("--project", required=True, help="project id the SRS was generated for")
     parser.add_argument("--out-dir", default=None, help=f"default: {config.OUTPUT_DIR}")
     parser.add_argument("--name", default=None, help="file name (default: SRS_<project>_v<version>_<date>.md)")
     args = parser.parse_args()
@@ -349,7 +357,8 @@ if __name__ == "__main__":
 
     data = json.loads(Path(args.srs_json).read_text(encoding="utf-8"))
     try:
-        path = export(data, requirement_registry.get_approved(), out_dir=args.out_dir, filename=args.name)
+        path = export(data, requirement_registry.get_approved(project_id=args.project),
+                      out_dir=args.out_dir, filename=args.name, project_id=args.project)
     except (srs_validator.SrsValidationError, requirement_registry.RegistryError) as e:
         for err in getattr(e, "errors", [str(e)]):
             logging.error("%s", err)
