@@ -372,6 +372,24 @@ class SQLiteRepository:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def list_passages_for_index(self) -> list[dict[str, Any]]:
+        """Every passage with its document's filename and project ids, for the
+        vector index (retrieval.indexer). project_ids is a sorted list, empty
+        when the document is not linked to any project."""
+        rows = self.conn.execute(
+            "SELECT sp.id, sp.document_id, sp.page, sp.text, d.filename, "
+            "       (SELECT json_group_array(pd.project_id) FROM project_documents pd "
+            "         WHERE pd.document_id = sp.document_id) AS project_ids "
+            "FROM source_passages sp JOIN documents d ON d.id = sp.document_id "
+            "ORDER BY sp.document_id, sp.page, sp.created_at, sp.rowid"
+        ).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["project_ids"] = sorted(json.loads(d["project_ids"] or "[]"))
+            result.append(d)
+        return result
+
     def get_requirements_for_passage(self, passage_id: str) -> list[dict[str, Any]]:
         """Reverse trace: which requirements cite this passage as evidence."""
         rows = self.conn.execute(

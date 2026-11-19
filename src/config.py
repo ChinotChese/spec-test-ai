@@ -43,3 +43,27 @@ GEMINI_RETRY_ATTEMPTS = int(os.getenv("GEMINI_RETRY_ATTEMPTS", "4"))      # tota
 GEMINI_RETRY_INITIAL_DELAY = float(os.getenv("GEMINI_RETRY_INITIAL_DELAY", "2"))  # seconds
 GEMINI_RETRY_MAX_DELAY = float(os.getenv("GEMINI_RETRY_MAX_DELAY", "30"))          # seconds
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# Embeddings (retrieval.embedding). gemini-embedding-001 returns 3072 dims by
+# default; 768 / 1536 are the recommended smaller sizes. Changing the model or
+# the size needs a new (or dropped) collection: the vector size is fixed there.
+GEMINI_MODEL_EMBEDDING = os.getenv("GEMINI_MODEL_EMBEDDING", "gemini-embedding-001")
+GEMINI_EMBEDDING_DIM = int(os.getenv("GEMINI_EMBEDDING_DIM", "1536"))
+GEMINI_EMBEDDING_BATCH_SIZE = int(os.getenv("GEMINI_EMBEDDING_BATCH_SIZE", "100"))  # API max 100
+
+
+def _optional_bool(name: str) -> bool | None:
+    value = os.getenv(name, "").strip().lower()
+    if not value:
+        return None
+    return value in ("1", "true", "yes", "on")
+
+
+# Qdrant (retrieval.qdrant_store). QDRANT_HOST may also be a full URL
+# (http://host:6333). QDRANT_HTTPS unset: the client uses https when an API key
+# is set; set QDRANT_HTTPS=false for a plain-http server with an API key.
+QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY") or None
+QDRANT_HTTPS = _optional_bool("QDRANT_HTTPS")
+QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "source_passages")
+QDRANT_TIMEOUT = int(os.getenv("QDRANT_TIMEOUT", "30"))  # seconds

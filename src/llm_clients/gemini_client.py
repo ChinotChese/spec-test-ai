@@ -5,6 +5,7 @@
     * our own 429 handling (retry short rate limits, never the daily quota),
     * a check that the answer was not cut off (finish_reason must be STOP).
   Returns the raw JSON text; callers validate it with their own Pydantic model.
+- embed_texts(): one embed_content call (retrieval.embedding), same 429 handling.
 
 Errors are raised as GeminiError (or google.genai.errors.APIError for
 non-retryable HTTP errors such as 400 / 403 / 404).
@@ -144,10 +145,43 @@ def _classify_429(payload: Any) -> _RateLimit:
 
 def _generate(client: Any, name: str, **request: Any) -> Any:
     """generate_content with our own handling of 429 (see _classify_429)."""
+    return call_with_rate_limit(name, lambda: client.models.generate_content(**request))
+
+
+def embed_texts(
+    client: Any,
+    *,
+    name: str,
+    model: str,
+    texts: list[str],
+    task_type: str,
+    output_dimensionality: int | None = None,
+) -> list[list[float]]:
+    """One embed_content call for `texts` (at most 100), same 429 handling.
+
+    Returns one vector per text, in order. `client` may be None or a fake with
+    `.models.embed_content(...)`.
+    """
+    client = client or make_client()
+    request_config: dict[str, Any] = {"task_type": task_type}
+    if output_dimensionality:
+        request_config["output_dimensionality"] = output_dimensionality
+    response = call_with_rate_limit(
+        name,
+        lambda: client.models.embed_content(model=model, contents=texts, config=request_config),
+    )
+    embeddings = getattr(response, "embeddings", None) or []
+    if len(embeddings) != len(texts):
+        raise GeminiError(f"{name}: Gemini returned {len(embeddings)} embeddings for {len(texts)} texts")
+    return [list(e.values) for e in embeddings]
+
+
+def call_with_rate_limit(name: str, call: Any) -> Any:
+    """Run `call()`; retry short 429 rate limits, never the daily quota."""
     attempts = max(config.GEMINI_RETRY_ATTEMPTS, 1)
     for attempt in range(1, attempts + 1):
         try:
-            return client.models.generate_content(**request)
+            return call()
         except Exception as e:  # google.genai.errors.APIError, duck-typed
             if getattr(e, "code", None) != 429:
                 raise
