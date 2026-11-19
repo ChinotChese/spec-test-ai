@@ -14,6 +14,9 @@ Running it again is safe and cheap; nothing is indexed twice:
      under another passage) are embedded once; the vector is reused.
   4. When only the metadata changed (e.g. the document was linked to another
      project), the payload is updated in place, without an embedding call.
+  5. Each point also stores a BM25 sparse vector (retrieval.sparse, computed
+     locally, no API call). When sparse.VERSION changes, points are rewritten
+     with their stored dense vector.
 
 Passages of documents that belong to no project are skipped: retrieval is
 always filtered by project, so they could never be found. They are indexed
@@ -33,13 +36,13 @@ from typing import Any
 
 import config
 from database.sqlite_repository import SQLiteRepository
-from retrieval import embedding, qdrant_store
+from retrieval import embedding, qdrant_store, sparse
 
 logger = logging.getLogger(__name__)
 
 # Payload keys compared to decide "metadata changed" (content_hash covers text + model).
 _META_KEYS = ("passage_id", "document_id", "filename", "page", "project_ids")
-_SCAN_FIELDS = ("passage_id", "content_hash", *_META_KEYS)
+_SCAN_FIELDS = ("passage_id", "content_hash", "sparse_version", *_META_KEYS)
 
 
 class IndexerError(Exception):
@@ -50,8 +53,8 @@ class IndexerError(Exception):
 class IndexReport:
     collection: str
     in_scope: int = 0                 # passages considered in this run
-    embedded: int = 0                 # points written with a newly computed vector
-    reused: int = 0                   # points written with a vector copied from an identical text
+    embedded: int = 0                 # points written with a newly computed dense vector
+    reused: int = 0                   # points written with a stored dense vector (same text)
     payload_updated: int = 0          # metadata changed, vector kept
     unchanged: int = 0                # already indexed and up to date
     skipped_no_project: int = 0
@@ -72,6 +75,7 @@ def build_payload(row: dict[str, Any], text_hash: str) -> dict[str, Any]:
         "text": row["text"],
         "project_ids": list(row["project_ids"]),
         "content_hash": text_hash,
+        "sparse_version": sparse.VERSION,
         "embedding_model": embedding.model_name(),
         "embedding_dim": embedding.dimension(),
     }
@@ -110,7 +114,9 @@ def index_passages(
         if dry_run and not qdrant.collection_exists(collection):
             indexed: dict[str, dict[str, Any]] = {}
         else:
-            if not dry_run and qdrant_store.ensure_collection(qdrant, collection, embedding.dimension()):
+            if dry_run:
+                qdrant_store.check_layout(qdrant, collection, embedding.dimension())
+            elif qdrant_store.ensure_collection(qdrant, collection, embedding.dimension()):
                 logger.info("created collection %s (%d dims, cosine)", collection, embedding.dimension())
             indexed = {
                 r.payload["passage_id"]: {"point_id": str(r.id), **r.payload}
@@ -136,7 +142,8 @@ def index_passages(
             continue
         text_hash = embedding.content_hash(row["text"])
         existing = indexed.get(row["id"])
-        if existing is not None and existing.get("content_hash") == text_hash:
+        if (existing is not None and existing.get("content_hash") == text_hash
+                and existing.get("sparse_version") == sparse.VERSION):
             payload = build_payload(row, text_hash)
             if any(existing.get(k) != payload[k] for k in _META_KEYS):
                 payload_updates.append((existing["point_id"], payload))
@@ -153,9 +160,15 @@ def index_passages(
 
     report.orphans = sorted(pid for pid in indexed if pid not in known_ids)
 
-    if dry_run:
-        report.embedded = len(to_embed)
-        report.embedding_calls = len({h for _, h in to_embed})
+    if dry_run:  # same counting as _embed_and_upsert, without the calls
+        have = {p.get("content_hash") for p in indexed.values()}
+        for _, h in to_embed:
+            if h in have:
+                report.reused += 1
+            else:
+                report.embedded += 1
+                report.embedding_calls += 1
+                have.add(h)
         return report
 
     try:
@@ -203,7 +216,9 @@ def _embed_and_upsert(
                 vectors[h] = v
             report.embedding_calls += len(hashes)
         qdrant_store.upsert(qdrant, collection, [
-            (qdrant_store.point_id(row["id"]), vectors[h], build_payload(row, h)) for row, h in batch
+            (qdrant_store.point_id(row["id"]), vectors[h], sparse.encode_document(row["text"]),
+             build_payload(row, h))
+            for row, h in batch
         ])
         fresh = set(new_texts)
         for _, h in batch:
