@@ -29,6 +29,15 @@ Prompt (CAG long context, prompts/srs_prompt.py), stable part first:
      the cited documents is sent instead, with a warning (the pre-retrieval
      behaviour). GenerationReport.evidence says which mode was used.
 
+Cache reuse (llm_clients.context_cache), GEMINI_CONTEXT_CACHE:
+  explicit (default) - part 1 is stored as a Gemini cache named after the core
+                       context version and reused across calls and runs;
+                       requests then send only parts 2-3. If the cache cannot
+                       be created, or expires mid-run, the full prompt is sent.
+  off                - the full prompt every time (implicit caching may hit).
+Every model call's token usage, including cached tokens, is in
+GenerationReport.usage; GenerationReport.cache says what was used.
+
 Checks on the model's answer (one retry with feedback, then GenerationError):
   - each listed feature present once, with a description and >= 1 sequence;
   - a sequence linking an id that is not a requirement of that feature is dropped;
@@ -63,7 +72,7 @@ from pydantic import BaseModel, Field, ValidationError, create_model
 import config
 from database.sqlite_repository import SQLiteRepository
 from context.core_context import CoreContextError, load_core_context
-from llm_clients import gemini_client
+from llm_clients import context_cache, gemini_client
 from prompts.srs_prompt import SYSTEM_PROMPT, build_system_instruction, build_user_prompt
 from schemas.requirement import Requirement
 from schemas.srs import SRS, build_toc
@@ -180,6 +189,16 @@ class EvidenceInfo:
 
 
 @dataclass
+class CacheInfo:
+    mode: str                     # "explicit" | "off" | "unavailable" (creation failed)
+    name: str | None = None       # cachedContents/... when explicit
+    display_name: str | None = None
+    created: bool = False         # True: created by this run; False: reused
+    tokens: int | None = None     # tokens stored in the cache
+    expired_mid_run: bool = False  # the cache vanished; later calls sent the full prompt
+
+
+@dataclass
 class GenerationReport:
     srs: SRS
     requirement_map: dict[str, str]          # SRS id (REQ-1.1 / NF-1.1) -> registry id (RQ-0013)
@@ -189,6 +208,16 @@ class GenerationReport:
     project_id: str | None = None            # the one project all requirements belong to
     core_context_version: str | None = None  # context.core_context version in the prompt
     evidence: EvidenceInfo | None = None     # how the evidence passages were chosen
+    cache: CacheInfo | None = None           # context cache used for the stable prefix
+    usage: list[gemini_client.Usage] = field(default_factory=list)  # one per model call
+
+    @property
+    def cached_tokens(self) -> int:
+        return sum(u.cached_tokens for u in self.usage)
+
+    @property
+    def prompt_tokens(self) -> int:
+        return sum(u.prompt_tokens for u in self.usage)
 
 
 # ------------------------------------------------------------------- public
@@ -217,6 +246,7 @@ def generate_with_report(
     repo: SQLiteRepository | None = None,
     retrieval: bool = True,
     retrieve: Callable[[str, dict[str, str]], dict[str, list[str]]] | None = None,
+    cache: bool | None = None,
 ) -> GenerationReport:
     """Generate and validate an SRS; see the module docstring for the rules.
 
@@ -230,6 +260,8 @@ def generate_with_report(
     `retrieval`: False sends only the cited passages (no Qdrant / embedding call).
     `retrieve(project_id, {key: query}) -> {key: [passage_id, ...]}` replaces
     the default hybrid search (tests).
+    `cache`: use an explicit context cache for the stable prefix; None follows
+    GEMINI_CONTEXT_CACHE.
     """
     try:
         core = load_core_context()
@@ -260,13 +292,32 @@ def generate_with_report(
 
     control = _document_control(template, project_name, organization, prepared_by, version, date)
     passage_ids = {p["id"] for p in passages}
+    model = model or config.GEMINI_MODEL_GENERATOR
+    use_cache = config.GEMINI_CONTEXT_CACHE == "explicit" if cache is None else cache
+    cache_info, handle = CacheInfo("off"), None
+    if use_cache:
+        try:
+            client = client or gemini_client.make_client(api_version=config.GEMINI_CACHE_API_VERSION)
+            handle = context_cache.get_or_create(client, model=model, system_instruction=system_instruction,
+                                                 version=core.version)
+            cache_info = CacheInfo("explicit", handle.name, handle.display_name, handle.created, handle.tokens)
+        except (context_cache.ContextCacheError, gemini_client.GeminiError) as e:
+            warnings.append(f"explicit context cache unavailable ({e}); sent the full prompt")
+            cache_info = CacheInfo("unavailable")
+    usage: list[gemini_client.Usage] = []
     feedback: list[str] | None = None
     logger.info("SRS prompt: core context %s, %d approved requirements, evidence %s "
                 "(%d cited + %d retrieved = %d passages)", core.version, len(reqs), evidence.mode,
                 evidence.cited, evidence.retrieved, evidence.sent)
     for attempt in range(1, _MAX_ATTEMPTS + 1):
-        draft = _ask_model(client, model, features, nonfunctional, passages, feedback,
-                           system_instruction=system_instruction)
+        draft, call_usage = _ask_model(client, model, features, nonfunctional, passages, feedback,
+                                       system_instruction=system_instruction,
+                                       cached_content=handle.name if handle else None)
+        if call_usage is not None:
+            usage.append(call_usage)
+            if handle and call_usage.cached_content is None:  # cache expired during the run
+                warnings.append(f"context cache {handle.name} expired during the run; sent the full prompt")
+                cache_info.expired_mid_run, handle = True, None
         problems, attempt_warnings, cleaned = _check_draft(draft, features, passage_ids)
         if not problems:
             warnings.extend(attempt_warnings)
@@ -290,7 +341,7 @@ def generate_with_report(
         raise GenerationError("Requirement mapping is not one-to-one with the approved input")
     return GenerationReport(srs, requirement_map, [d["id"] for d in documents], warnings, attempt,
                             project_id=project["id"], core_context_version=core.version,
-                            evidence=evidence)
+                            evidence=evidence, cache=cache_info, usage=usage)
 
 
 # --------------------------------------------------------------- inputs
@@ -460,23 +511,38 @@ def _document_control(
 
 
 def _ask_model(client, model, features, nonfunctional, passages, feedback, *,
-               system_instruction: str = SYSTEM_PROMPT) -> dict[str, Any]:
+               system_instruction: str = SYSTEM_PROMPT,
+               cached_content: str | None = None) -> tuple[dict[str, Any], gemini_client.Usage]:
+    """One model call; returns (parsed draft, token usage).
+
+    With `cached_content`, the system instruction comes from that cache. If the
+    cache is gone (expired / deleted), the call is repeated once with the full
+    system instruction; the returned usage then has cached_content None.
+    """
+    request = {
+        "name": "SRS",
+        "model": model or config.GEMINI_MODEL_GENERATOR,
+        "contents": [build_user_prompt(features, nonfunctional, passages, feedback)],
+        "system_instruction": system_instruction,
+        "response_schema": RESPONSE_SCHEMA,
+    }
     try:
-        text = gemini_client.generate_json(
-            client,
-            name="SRS",
-            model=model or config.GEMINI_MODEL_GENERATOR,
-            contents=[build_user_prompt(features, nonfunctional, passages, feedback)],
-            system_instruction=system_instruction,
-            response_schema=RESPONSE_SCHEMA,
-        )
+        try:
+            result = gemini_client.generate_json_with_usage(client, cached_content=cached_content, **request)
+        except _API_ERRORS as e:
+            if not (cached_content and context_cache.is_cache_missing(e)):
+                raise
+            logger.warning("SRS: context cache %s is gone (HTTP %s); sending the full prompt",
+                           cached_content, e.code)
+            result = gemini_client.generate_json_with_usage(client, **request)
+        text = result.text
     except gemini_client.GeminiError as e:
         raise GenerationError(str(e)) from e
     except _API_ERRORS as e:
         status = f" {e.status}" if e.status else ""
         raise GenerationError(f"SRS: Gemini HTTP {e.code}{status}: {e.message}") from e
     try:
-        return json.loads(text)
+        return json.loads(text), result.usage
     except json.JSONDecodeError as e:
         raise GenerationError(f"SRS: Gemini response is not JSON: {e}") from e
 
@@ -703,6 +769,11 @@ if __name__ == "__main__":
                 len(report.srs.system_features), len(report.requirement_map),
                 ", ".join(report.documents), report.attempts, report.core_context_version,
                 report.evidence.mode, report.evidence.cited, report.evidence.retrieved)
+    logger.info("cache %s%s: %d of %d prompt tokens cached over %d call(s)",
+                report.cache.mode,
+                f" ({'created' if report.cache.created else 'reused'} {report.cache.display_name})"
+                if report.cache.name else "",
+                report.cached_tokens, report.prompt_tokens, len(report.usage))
     payload = report.srs.model_dump_json(indent=2)
     if args.out:
         with open(args.out, "w", encoding="utf-8") as fh:

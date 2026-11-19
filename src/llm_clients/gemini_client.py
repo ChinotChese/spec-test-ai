@@ -1,10 +1,16 @@
 """Shared Gemini plumbing for every step that calls the model.
 
 - make_client(): API key from config, timeout, SDK retries for 408 / 5xx.
+  api_version="v1beta" is needed for explicit context caching
+  (llm_clients.context_cache); the SDK default (v1) has no cachedContents.
 - generate_json(): one structured-output call with
     * our own 429 handling (retry short rate limits, never the daily quota),
     * a check that the answer was not cut off (finish_reason must be STOP).
   Returns the raw JSON text; callers validate it with their own Pydantic model.
+- generate_json_with_usage(): the same, plus token usage (Usage), including
+  how many prompt tokens came from a cache. Optional cached_content: the name
+  of an explicit cache that holds the system instruction.
+  Every call logs its usage: "tokens prompt=... cached=... output=...".
 - embed_texts(): one embed_content call (retrieval.embedding), same 429 handling.
 
 Errors are raised as GeminiError (or google.genai.errors.APIError for
@@ -29,7 +35,26 @@ class GeminiError(Exception):
     """The model call failed or its answer is unusable."""
 
 
-def make_client() -> Any:
+@dataclass(frozen=True)
+class Usage:
+    """Token counts of one call, from response.usage_metadata."""
+    prompt_tokens: int = 0
+    cached_tokens: int = 0        # part of prompt_tokens served from a cache (implicit or explicit)
+    output_tokens: int = 0
+    cached_content: str | None = None  # explicit cache used, if any
+
+    @property
+    def cached_ratio(self) -> float:
+        return self.cached_tokens / self.prompt_tokens if self.prompt_tokens else 0.0
+
+
+@dataclass(frozen=True)
+class GeminiResult:
+    text: str
+    usage: Usage
+
+
+def make_client(api_version: str | None = None) -> Any:
     if not config.GEMINI_API_KEY:
         raise GeminiError("GEMINI_API_KEY is not set; add it to src/.env")
     try:
@@ -40,6 +65,7 @@ def make_client() -> Any:
     return genai.Client(
         api_key=config.GEMINI_API_KEY,
         http_options=types.HttpOptions(
+            api_version=api_version,
             timeout=config.GEMINI_TIMEOUT_MS,
             # Without retry_options the SDK tries a sync request exactly once.
             # The SDK retries 408 / 5xx and transient connection errors. 429 is
@@ -71,19 +97,44 @@ def generate_json(
     `client` may be None (a real client is created) or any object with
     `.models.generate_content(...)`, which lets tests use a fake.
     """
+    return generate_json_with_usage(
+        client, name=name, model=model, contents=contents, system_instruction=system_instruction,
+        response_schema=response_schema, temperature=temperature,
+    ).text
+
+
+def generate_json_with_usage(
+    client: Any,
+    *,
+    name: str,
+    model: str,
+    contents: list[Any],
+    system_instruction: str | None,
+    response_schema: dict[str, Any],
+    temperature: float = 0,
+    cached_content: str | None = None,
+) -> GeminiResult:
+    """generate_json() plus token usage.
+
+    With `cached_content` (an explicit cache name), the system instruction
+    lives in the cache: the API refuses a request that sets both, so
+    `system_instruction` is not sent. The client must use api_version v1beta.
+    """
     client = client or make_client()
-    response = _generate(
-        client,
-        name,
-        model=model,
-        contents=contents,
-        config={
-            "system_instruction": system_instruction,
-            "response_mime_type": "application/json",
-            "response_json_schema": response_schema,
-            "temperature": temperature,
-        },
-    )
+    request_config: dict[str, Any] = {
+        "response_mime_type": "application/json",
+        "response_json_schema": response_schema,
+        "temperature": temperature,
+    }
+    if cached_content:
+        request_config["cached_content"] = cached_content
+    else:
+        request_config["system_instruction"] = system_instruction
+    response = _generate(client, name, model=model, contents=contents, config=request_config)
+    usage = _usage(response, cached_content)
+    logger.info("%s: tokens prompt=%d cached=%d (%.0f%%%s) output=%d", name, usage.prompt_tokens,
+                usage.cached_tokens, 100 * usage.cached_ratio,
+                ", explicit cache" if cached_content else "", usage.output_tokens)
     candidates = getattr(response, "candidates", None) or []
     if not candidates:
         feedback = getattr(response, "prompt_feedback", None)
@@ -92,7 +143,15 @@ def generate_json(
     reason_name = getattr(reason, "name", str(reason))
     if reason_name != "STOP":
         raise GeminiError(f"{name}: Gemini stopped early (finish_reason={reason_name})")
-    return response.text or ""
+    return GeminiResult(response.text or "", usage)
+
+
+def _usage(response: Any, cached_content: str | None) -> Usage:
+    meta = getattr(response, "usage_metadata", None)
+    def count(field: str) -> int:
+        return int(getattr(meta, field, None) or 0)
+    return Usage(count("prompt_token_count"), count("cached_content_token_count"),
+                 count("candidates_token_count"), cached_content)
 
 
 # ------------------------------------------------------------ 429 handling

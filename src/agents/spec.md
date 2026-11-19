@@ -372,7 +372,33 @@ Quy tắc chính:
 - Thà `unresolved` còn hơn bịa.
 - **Core context** (`<core_context>` ở cuối system instruction) là hướng dẫn **cách viết** (cấu trúc, thuật ngữ, quy tắc), không phải nguồn sự thật về sản phẩm: không lấy dữ kiện từ đó, không trích nó trong `source_ids`. Khi mâu thuẫn, `SYSTEM_PROMPT` thắng.
 
-**Bố cục để cache.** System instruction (`build_system_instruction`) giống nhau từng byte giữa mọi lần gọi có cùng `core_context_version` (khoảng 7.6k token với `gemini-3.8-flash`, trên ngưỡng 4.096 token của implicit caching). Phần thay đổi (requirement, evidence, feedback) nằm sau. Cache reuse (implicit / explicit) là bước tiếp theo, chưa làm.
+**Bố cục để cache.** System instruction (`build_system_instruction`) giống nhau từng byte giữa mọi lần gọi có cùng `core_context_version` (khoảng 7.7k token với `gemini-3.8-flash`, trên ngưỡng 4.096 token của implicit caching). Phần thay đổi (requirement, evidence, feedback) nằm sau.
+
+### 2.5.1 Cache reuse
+
+[llm_clients/context_cache.py](../llm_clients/context_cache.py), cấu hình bằng `GEMINI_CONTEXT_CACHE`:
+
+| Giá trị | Cách làm |
+|---|---|
+| `explicit` (mặc định) | System instruction được lưu thành một Gemini cache và tham chiếu bằng tên. Request chỉ gửi requirement + evidence (+ feedback) |
+| `off` | Luôn gửi prompt đầy đủ; implicit caching của Gemini có thể trúng nếu may |
+
+- **Định danh cache**: `display_name = "spectest-<core version>-<sha256(system instruction)[:8]>"`, cộng với model. Core context đổi, `SYSTEM_PROMPT` đổi hoặc đổi model thì dùng cache khác, không bao giờ dùng lại cache cũ.
+- **Vòng đời**: tạo với TTL `GEMINI_CACHE_TTL_SECONDS` (mặc định 600 giây). Mỗi lần dùng lại thì gia hạn thêm một TTL, nên chạy liên tiếp thì cache còn sống, ngừng chạy thì cache tự hết hạn. Cache bị tính phí lưu theo thời gian.
+- **API**: cache chỉ có ở `v1beta` (`GEMINI_CACHE_API_VERSION`). Khi bật cache, generator tạo client `v1beta` cho cả lần gọi model. Request có `cached_content` thì **không được** gửi `system_instruction` (API trả 400), nên `gemini_client.generate_json_with_usage` bỏ field này đi.
+- **Fallback**: không tạo hoặc tìm được cache thì ghi warning và gửi prompt đầy đủ (`cache.mode = "unavailable"`). Cache hết hạn giữa chừng (API trả 403 "CachedContent not found") thì gọi lại lần đó với prompt đầy đủ, ghi warning, và đặt `cache.expired_mid_run = True`.
+- **Đo cache hit**: mọi lần gọi model ghi log `tokens prompt=… cached=… (…%) output=…`, lấy từ `usage_metadata.cached_content_token_count`. `GenerationReport.usage` chứa usage từng lần gọi; `report.cached_tokens` / `report.prompt_tokens` là tổng.
+- **Quản lý**: `python -m llm_clients.context_cache --list` liệt kê, `--clear` xoá các cache `spectest-*`.
+
+Đo trên `gemini-3.8-flash`, 33 requirement, 75 passage:
+
+| | Prompt | Cached | Ghi chú |
+|---|---|---|---|
+| Implicit (Mức 1, 13 request thử, prompt chỉ có prefix 7.6k) | – | 0 / 13 lần trúng | Không dựa vào được |
+| Explicit, lần chạy 1 | 14.685 | 7.707 (52%) | Tạo cache |
+| Explicit, lần chạy 2 | 14.685 | 7.707 (52%) | Dùng lại cache, gia hạn TTL |
+
+Cả hai SRS đều qua `srs_validator`.
 
 ### 2.6 API
 
@@ -383,12 +409,13 @@ from agents import srs_generator
 | Hàm | Mô tả |
 |---|---|
 | `generate(requirements, template=None, **options) -> SRS` | Như `app.py` gọi (`generate(requirements=..., template=...)`) |
-| `generate_with_report(requirements, *, template=None, project_name=None, organization=None, prepared_by=None, version="1.0", date=None, client=None, model=None, repo=None, retrieval=True, retrieve=None) -> GenerationReport` | Như trên, kèm báo cáo |
+| `generate_with_report(requirements, *, template=None, project_name=None, organization=None, prepared_by=None, version="1.0", date=None, client=None, model=None, repo=None, retrieval=True, retrieve=None, cache=None) -> GenerationReport` | Như trên, kèm báo cáo |
 
 - `template`: dict đã parse từ `templates/standard_srs.yaml` (không bắt buộc). Nếu có, `document_control` của nó được dùng làm giá trị mặc định. Generator không tự đọc YAML, vì `.venv` hiện chưa có PyYAML.
 - `repo`: mặc định mở `config.DB_PATH`. `client`: mặc định tạo Gemini client; có thể truyền client giả khi test.
 - `retrieval=False`: chỉ gửi passage được trích dẫn, không gọi Qdrant hay embedding.
 - `retrieve(project_id, {key: query}) -> {key: [passage_id, …]}`: thay hybrid search mặc định (dùng trong test, để không gọi mạng).
+- `cache`: `True`/`False` bật/tắt explicit cache cho lần gọi này; `None` theo `GEMINI_CONTEXT_CACHE` (mục 2.5.1).
 - Core context thiếu, rỗng hoặc lỗi encoding thì raise `GenerationError("Core context unavailable: …")` trước khi gọi model.
 
 `GenerationReport`:
@@ -403,6 +430,8 @@ from agents import srs_generator
 | `project_id` | Dự án của SRS |
 | `core_context_version` | Version của core context trong prompt, ví dụ `core-7dbbe17fa93dafa6` |
 | `evidence` | `EvidenceInfo(mode, cited, retrieved, sent, queries)` |
+| `cache` | `CacheInfo(mode, name, display_name, created, tokens, expired_mid_run)` |
+| `usage` | `list[gemini_client.Usage]`, mỗi lần gọi model một phần tử: `prompt_tokens`, `cached_tokens`, `output_tokens`, `cached_content`. `cached_tokens` / `prompt_tokens` của report là tổng |
 
 Lỗi: mọi trường hợp đều là `GenerationError`, gồm lỗi Gemini (quota, response bị cắt, HTTP 4xx…), đầu vào không hợp lệ, và output vẫn sai sau 2 lần gọi. Generator **không lưu** SRS vào `srs_runs`.
 

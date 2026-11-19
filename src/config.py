@@ -75,3 +75,13 @@ QDRANT_TIMEOUT = int(os.getenv("QDRANT_TIMEOUT", "30"))  # seconds
 SRS_RETRIEVAL_MODE = os.getenv("SRS_RETRIEVAL_MODE", "hybrid")  # hybrid / dense / sparse
 SRS_RETRIEVAL_TOP_K = int(os.getenv("SRS_RETRIEVAL_TOP_K", "4"))
 SRS_RETRIEVAL_MAX_PASSAGES = int(os.getenv("SRS_RETRIEVAL_MAX_PASSAGES", "40"))
+
+# Context cache for the SRS generator's stable prefix (system prompt + core
+# context), see llm_clients.context_cache.
+#   explicit  create / reuse a Gemini cache named after the core context version
+#             (needs the v1beta API); falls back to the full prompt on failure
+#   off       always send the full prompt (Gemini implicit caching may still hit)
+# Cached tokens of every call are logged and reported either way.
+GEMINI_CONTEXT_CACHE = os.getenv("GEMINI_CONTEXT_CACHE", "explicit")
+GEMINI_CACHE_TTL_SECONDS = int(os.getenv("GEMINI_CACHE_TTL_SECONDS", "600"))
+GEMINI_CACHE_API_VERSION = os.getenv("GEMINI_CACHE_API_VERSION", "v1beta")

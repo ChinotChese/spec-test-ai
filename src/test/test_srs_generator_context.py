@@ -1,26 +1,34 @@
-"""SRS generator prompt: approved requirements + core context (CAG) + retrieved evidence.
+"""SRS generator prompt: approved requirements + core context (CAG) + retrieved
+evidence (level 1), and the explicit context cache (level 2).
 
 Run from src/:  python -m unittest discover -s test -t .
-No network: the model call is captured at gemini_client.generate_json and
-retrieval is a fake function. Fixtures are synthetic.
+No network: level-1 tests capture the model call at
+gemini_client.generate_json_with_usage; cache tests run the real gemini_client
+and context_cache code against a fake Gemini client. Retrieval is a fake
+function. Fixtures are synthetic.
 """
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import config
 from agents import srs_generator
 from context.core_context import CoreContextError, load_core_context
 from database.sqlite_repository import SQLiteRepository
-from prompts.srs_prompt import SYSTEM_PROMPT
+from llm_clients import gemini_client
+from prompts.srs_prompt import SYSTEM_PROMPT, build_system_instruction
 from services import project_registry, requirement_registry
 from test.test_project_pipeline import draft, fake_model_draft
 
 
-class GeneratorContextTest(unittest.TestCase):
+class GeneratorFixture(unittest.TestCase):
+    """Project, documents and one approved requirement; cache off by default."""
+
     def setUp(self) -> None:
         self.repo = SQLiteRepository(":memory:")
         self.addCleanup(self.repo.close)
@@ -44,18 +52,23 @@ class GeneratorContextTest(unittest.TestCase):
 
         self.calls: list[dict] = []
         self.model_draft = None
+        patcher = mock.patch.object(config, "GEMINI_CONTEXT_CACHE", "off")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def draft_json(self) -> str:
+        if self.model_draft is not None:
+            return json.dumps(self.model_draft)
+        return json.dumps(fake_model_draft([("Login", [{"id": self.rid}])], [], []))
 
     def fake_generate_json(self, client, **kw):
         self.calls.append(kw)
-        if self.model_draft is not None:
-            return json.dumps(self.model_draft)
-        prompt = kw["contents"][0]
-        features = [("Login", [{"id": self.rid}])]
-        return json.dumps(fake_model_draft(features, [], [p for p in prompt]))
+        return gemini_client.GeminiResult(self.draft_json(), gemini_client.Usage(100, 0, 10))
 
     def generate(self, hits=None, **kwargs):
         retrieve = kwargs.pop("retrieve", None) or (lambda project_id, queries: hits or {})
-        with mock.patch("llm_clients.gemini_client.generate_json", side_effect=self.fake_generate_json):
+        with mock.patch("llm_clients.gemini_client.generate_json_with_usage",
+                        side_effect=self.fake_generate_json):
             return srs_generator.generate_with_report([self.rid], repo=self.repo, retrieve=retrieve, **kwargs)
 
     @property
@@ -66,6 +79,8 @@ class GeneratorContextTest(unittest.TestCase):
     def prompt(self) -> str:
         return self.calls[-1]["contents"][0]
 
+
+class GeneratorContextTest(GeneratorFixture):
     # ------------------------------------------------------------- CAG layout
 
     def test_system_instruction_is_rules_then_core_context(self) -> None:
@@ -167,6 +182,145 @@ class GeneratorContextTest(unittest.TestCase):
     def test_retrieved_but_uncited_documents_are_not_references(self) -> None:
         report = self.generate(hits={"purpose": ["DOC-B-P0001"]})
         self.assertEqual(report.documents, [self.doc_a])
+
+
+# ---------------------------------------------------------------- level 2
+
+
+class FakeGemini:
+    """Just enough of google.genai.Client: caches.* and models.generate_content."""
+
+    CACHED = 7000
+
+    def __init__(self, test: "ExplicitCacheTest") -> None:
+        self.test = test
+        self.store: dict[str, SimpleNamespace] = {}
+        self.requests: list[dict] = []
+        self.create_calls = 0
+        self.fail_create: Exception | None = None
+        self.expire_on_use = False
+        self.caches = SimpleNamespace(list=self._list, create=self._create,
+                                      update=self._update, delete=self._delete)
+        self.models = SimpleNamespace(generate_content=self._generate)
+
+    @staticmethod
+    def _ttl(config) -> dt.datetime:
+        return dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=int(config.ttl.rstrip("s")))
+
+    def _list(self):
+        return list(self.store.values())
+
+    def _create(self, *, model, config):
+        self.create_calls += 1
+        if self.fail_create:
+            raise self.fail_create
+        name = f"cachedContents/c{self.create_calls}"
+        self.store[name] = SimpleNamespace(
+            name=name, display_name=config.display_name, model=f"models/{model}",
+            system_instruction=config.system_instruction, expire_time=self._ttl(config),
+            usage_metadata=SimpleNamespace(total_token_count=self.CACHED))
+        return self.store[name]
+
+    def _update(self, *, name, config):
+        self.store[name].expire_time = self._ttl(config)
+        return self.store[name]
+
+    def _delete(self, *, name):
+        self.store.pop(name, None)
+
+    def _generate(self, *, model, contents, config):
+        self.requests.append(config)
+        cached = config.get("cached_content")
+        if cached and self.expire_on_use:
+            self.store.clear()
+        if cached and cached not in self.store:
+            from google.genai import errors
+            raise errors.ClientError(403, {"error": {"code": 403, "status": "PERMISSION_DENIED",
+                                                     "message": "CachedContent not found (or permission denied)"}})
+        return SimpleNamespace(
+            candidates=[SimpleNamespace(finish_reason=SimpleNamespace(name="STOP"))],
+            text=self.test.draft_json(),
+            usage_metadata=SimpleNamespace(prompt_token_count=self.CACHED + 500,
+                                           cached_content_token_count=self.CACHED if cached else None,
+                                           candidates_token_count=300))
+
+
+class ExplicitCacheTest(GeneratorFixture):
+    def setUp(self) -> None:
+        super().setUp()
+        self.gemini = FakeGemini(self)
+
+    def run_cached(self, **kwargs):
+        return srs_generator.generate_with_report(
+            [self.rid], repo=self.repo, retrieve=lambda project_id, queries: {},
+            client=self.gemini, cache=True, **kwargs)
+
+    def test_cache_holds_the_level_1_prefix_and_requests_omit_it(self) -> None:
+        report = self.run_cached()
+        [cache] = self.gemini.store.values()
+        self.assertEqual(cache.system_instruction, build_system_instruction(load_core_context().render()))
+        [request] = self.gemini.requests
+        self.assertEqual(request["cached_content"], cache.name)
+        self.assertNotIn("system_instruction", request)
+        self.assertEqual((report.cache.mode, report.cache.created, report.cache.tokens),
+                         ("explicit", True, FakeGemini.CACHED))
+
+    def test_cache_is_named_after_the_core_context_version(self) -> None:
+        report = self.run_cached()
+        self.assertTrue(report.cache.display_name.startswith(f"spectest-{load_core_context().version}-"))
+
+    def test_second_run_reuses_the_cache(self) -> None:
+        first = self.run_cached()
+        second = self.run_cached()
+        self.assertEqual(self.gemini.create_calls, 1)
+        self.assertFalse(second.cache.created)
+        self.assertEqual(second.cache.name, first.cache.name)
+
+    def test_usage_reports_cached_tokens_from_usage_metadata(self) -> None:
+        report = self.run_cached()
+        [usage] = report.usage
+        self.assertEqual((usage.prompt_tokens, usage.cached_tokens, usage.output_tokens),
+                         (FakeGemini.CACHED + 500, FakeGemini.CACHED, 300))
+        self.assertEqual(report.cached_tokens, FakeGemini.CACHED)
+        self.assertAlmostEqual(usage.cached_ratio, FakeGemini.CACHED / (FakeGemini.CACHED + 500))
+
+    def test_a_new_core_version_gets_a_new_cache(self) -> None:
+        self.run_cached()
+        core = load_core_context()
+        changed = srs_generator.load_core_context()
+        with mock.patch.object(srs_generator, "load_core_context",
+                               return_value=type(core)(version="core-0000000000000000", sources=changed.sources)):
+            report = self.run_cached()
+        self.assertEqual(self.gemini.create_calls, 2)
+        self.assertIn("core-0000000000000000", report.cache.display_name)
+
+    def test_creation_failure_falls_back_to_the_full_prompt(self) -> None:
+        self.gemini.fail_create = RuntimeError("caching not available")
+        report = self.run_cached()
+        [request] = self.gemini.requests
+        self.assertNotIn("cached_content", request)
+        self.assertTrue(request["system_instruction"].startswith(SYSTEM_PROMPT))
+        self.assertEqual(report.cache.mode, "unavailable")
+        self.assertIn("explicit context cache unavailable", " ".join(report.warnings))
+
+    def test_cache_expiring_mid_run_repeats_the_call_with_the_full_prompt(self) -> None:
+        self.gemini.expire_on_use = True
+        report = self.run_cached()
+        first, second = self.gemini.requests
+        self.assertIn("cached_content", first)
+        self.assertNotIn("cached_content", second)
+        self.assertTrue(second["system_instruction"].startswith(SYSTEM_PROMPT))
+        self.assertTrue(report.cache.expired_mid_run)
+        self.assertIsNone(report.usage[0].cached_content)
+        self.assertIn("expired during the run", " ".join(report.warnings))
+
+    def test_cache_off_never_touches_caches(self) -> None:
+        self.gemini.caches = None  # any use would fail
+        report = srs_generator.generate_with_report(
+            [self.rid], repo=self.repo, retrieve=lambda project_id, queries: {},
+            client=self.gemini, cache=False)
+        self.assertEqual(report.cache.mode, "off")
+        self.assertIn("system_instruction", self.gemini.requests[0])
 
 
 if __name__ == "__main__":
