@@ -57,8 +57,8 @@ class PassageIndexerTest(unittest.TestCase):
         warnings_cm.__enter__()
         self.addCleanup(warnings_cm.__exit__, None, None, None)
         warnings.filterwarnings("ignore", "Payload indexes have no effect", UserWarning)
-        from retrieval import indexer, qdrant_store, retriever
-        self.indexer, self.store, self.retriever = indexer, qdrant_store, retriever
+        from retrieval import indexer, qdrant_store, retriever, sparse
+        self.indexer, self.store, self.retriever, self.sparse = indexer, qdrant_store, retriever, sparse
 
         self.repo = SQLiteRepository(":memory:")
         self.addCleanup(self.repo.close)
@@ -163,31 +163,91 @@ class PassageIndexerTest(unittest.TestCase):
 
     def test_foreign_points_in_the_collection_are_left_alone(self) -> None:
         self.run_index()
-        self.qdrant.upsert(COLLECTION, points=[models.PointStruct(id=1, vector=[0.5] * DIM,
-                                                                  payload={"other": "data"})])
+        self.qdrant.upsert(COLLECTION, points=[models.PointStruct(
+            id=1, vector={"dense": [0.5] * DIM}, payload={"other": "data"})])
         report = self.run_index(prune=True)
         self.assertEqual(report.orphans, [])
         self.assertEqual(self.count(), 6)
 
     def test_dry_run_writes_nothing(self) -> None:
         report = self.run_index(dry_run=True)
-        self.assertEqual((report.embedded, report.embedding_calls), (5, 4))
+        self.assertEqual((report.embedded, report.reused, report.embedding_calls), (4, 1, 4))
         self.assertEqual(self.gemini.calls, [])
         self.assertFalse(self.qdrant.collection_exists(COLLECTION))
 
     def test_vector_size_mismatch_is_refused(self) -> None:
-        self.qdrant.create_collection(COLLECTION, vectors_config=models.VectorParams(
-            size=DIM * 2, distance=models.Distance.COSINE))
+        self.qdrant.create_collection(
+            COLLECTION,
+            vectors_config={"dense": models.VectorParams(size=DIM * 2, distance=models.Distance.COSINE)},
+            sparse_vectors_config={"bm25": models.SparseVectorParams(modifier=models.Modifier.IDF)},
+        )
         with self.assertRaisesRegex(self.indexer.IndexerError, "GEMINI_EMBEDDING_DIM"):
             self.run_index()
 
-    def test_retrieval_is_filtered_by_project(self) -> None:
+    def test_old_single_vector_layout_is_refused(self) -> None:
+        self.qdrant.create_collection(COLLECTION, vectors_config=models.VectorParams(
+            size=DIM, distance=models.Distance.COSINE))
+        with self.assertRaisesRegex(self.indexer.IndexerError, "hybrid layout"):
+            self.run_index()
+
+    def test_sparse_version_change_rewrites_points_without_gemini(self) -> None:
         self.run_index()
-        hits = self.retriever.search_passages(self.p1, "Audit logs are kept for one year.", top_k=10,
-                                              client=self.qdrant, embed_client=self.gemini,
-                                              collection=COLLECTION)
-        self.assertEqual(sorted(h["passage_id"] for h in hits),
-                         ["DOC-A-P0001", "DOC-A-P0002", "DOC-A-P0003"])
+        self.gemini.calls.clear()
+        with mock.patch.object(self.sparse, "VERSION", "bm25-test"):
+            report = self.run_index()
+            self.assertEqual(self.gemini.calls, [])
+            self.assertEqual((report.embedded, report.reused), (0, 5))
+            self.assertEqual(self.payload("DOC-A-P0001")["sparse_version"], "bm25-test")
+
+    def search(self, project_id: str, query: str, mode: str = "hybrid", top_k: int = 10) -> list[str]:
+        return self.retriever.search_passage_ids(project_id, query, top_k, mode=mode, client=self.qdrant,
+                                                 embed_client=self.gemini, collection=COLLECTION)
+
+    def test_every_mode_is_filtered_by_project(self) -> None:
+        self.run_index()
+        for mode in ("hybrid", "dense", "sparse"):
+            with self.subTest(mode=mode):
+                hits = self.search(self.p1, "Audit logs passwords reports", mode)
+                self.assertTrue(hits)
+                self.assertTrue(set(hits) <= {"DOC-A-P0001", "DOC-A-P0002", "DOC-A-P0003"}, hits)
+
+    def test_sparse_finds_exact_terms(self) -> None:
+        self.run_index()
+        self.assertEqual(self.search(self.p1, "CSV", "sparse"), ["DOC-A-P0003"])
+        self.assertEqual(self.search(self.p1, "csv export", "hybrid")[0], "DOC-A-P0003")
+
+    def test_hybrid_returns_ranked_passage_ids(self) -> None:
+        self.run_index()
+        self.assertEqual(self.search(self.p2, "Audit logs are kept for one year.", top_k=1),
+                         ["DOC-B-P0002"])
+
+    def test_search_passages_returns_payload_fields(self) -> None:
+        self.run_index()
+        [hit] = self.retriever.search_passages(self.p1, "log in", 1, client=self.qdrant,
+                                               embed_client=self.gemini, collection=COLLECTION)
+        self.assertEqual(hit["passage_id"], "DOC-A-P0001")
+        self.assertEqual((hit["filename"], hit["page"]), ("a.pdf", 1))
+
+
+class SparseEncoderTest(unittest.TestCase):
+    def test_vietnamese_terms_keep_diacritics(self) -> None:
+        from retrieval import sparse
+        self.assertEqual(sparse.tokenize("Mã số Người dùng, MA"), ["mã", "số", "người", "dùng", "ma"])
+        self.assertNotEqual(sparse.encode_query("mã")[0], sparse.encode_query("ma")[0])
+
+    def test_nfc_and_nfd_text_give_the_same_vector(self) -> None:
+        import unicodedata
+        from retrieval import sparse
+        text = "Người dùng đăng nhập"
+        self.assertEqual(sparse.encode_document(text),
+                         sparse.encode_document(unicodedata.normalize("NFD", text)))
+
+    def test_repeated_terms_weigh_more_but_saturate(self) -> None:
+        from retrieval import sparse
+        _, [one] = sparse.encode_document("log")
+        _, [three] = sparse.encode_document("log log log")
+        self.assertGreater(three, one)
+        self.assertLess(three, 3 * one)
 
 
 if __name__ == "__main__":
