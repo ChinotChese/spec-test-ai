@@ -9,11 +9,11 @@ requirements, srs_runs, plus junction tables for the many-to-many links:
 Referential integrity is enforced by SQLite foreign keys. Rules a foreign key
 cannot express are checked here, inside the same transaction as the write:
   - an SRS run only includes approved requirements;
-  - a requirement with a project only cites passages from that project's
-    documents ("project scope");
-  - an SRS run with a project only includes requirements of that project.
-project_id may be NULL on requirements and SRS runs: "not assigned yet"
-(rows from before projects existed; see database.project_backfill).
+  - a requirement only cites passages from its project's documents
+    ("project scope");
+  - an SRS run only includes requirements of its project.
+Every requirement and SRS run belongs to a project (project_id NOT NULL,
+migration 003), and every write that creates one takes a project_id.
 
 The database is built and versioned by database.migrate. Opening a brand-new
 file runs every migration; an existing file that is behind is refused with
@@ -128,6 +128,30 @@ class SQLiteRepository:
             )
         return [self._project_from_row(r) for r in rows.fetchall()]
 
+    def update_project(
+        self, project_id: str, *, name: str | None = None, description: str | None = None
+    ) -> None:
+        """Rename a project and/or change its description (None = keep)."""
+        sets, params = [], []
+        if name is not None:
+            sets.append("name = ?")
+            params.append(name)
+        if description is not None:
+            sets.append("description = ?")
+            params.append(description)
+        if not sets:
+            return
+        try:
+            with self.conn:
+                cur = self.conn.execute(
+                    f"UPDATE projects SET {', '.join(sets)}, updated_at = {_NOW} WHERE id = ?",
+                    [*params, project_id],
+                )
+        except sqlite3.IntegrityError as e:
+            raise RepositoryError(f"Cannot update project {project_id!r}: {e}") from e
+        if cur.rowcount == 0:
+            raise RepositoryError(f"Project {project_id!r} not found")
+
     def delete_project(self, project_id: str) -> None:
         """Delete a project and its document links. Fails while it owns requirements or SRS runs."""
         try:
@@ -224,12 +248,14 @@ class SQLiteRepository:
         file_hash: str,
         file_path: str,
         passages: Sequence[tuple[str, int | None, str]],
+        project_id: str | None = None,
     ) -> str:
         """Insert a document and its (passage_id, page, text) rows in one transaction.
 
         If a document with this file_hash already exists, its id is reused and
-        the passages are attached to it. Either everything is written or nothing.
-        Returns the document id.
+        the passages are attached to it. With a project_id, the document is
+        also linked to that project in the same transaction. Either everything
+        is written or nothing. Returns the document id.
         """
         try:
             with self.conn:
@@ -248,6 +274,8 @@ class SQLiteRepository:
                     "INSERT INTO source_passages (id, document_id, page, text) VALUES (?, ?, ?, ?)",
                     [(pid, document_id, page, text) for pid, page, text in passages],
                 )
+                if project_id is not None:
+                    self._link_documents(project_id, [document_id])
         except sqlite3.IntegrityError as e:
             raise RepositoryError(f"Cannot save document {filename!r}: {e}") from e
         return document_id
@@ -370,16 +398,16 @@ class SQLiteRepository:
         verification_method: str | None = None,
         acceptance_measure: str | None = None,
         status: str = "pending",
-        project_id: str | None = None,
+        project_id: str,
         requirement_id: str | None = None,
     ) -> str:
-        """Insert a requirement.
+        """Insert a requirement of a project.
 
         Keyword names match schemas.requirement.RequirementDraft, so a draft
-        can be saved with `repo.add_requirement(**draft.model_dump())`.
+        can be saved with `repo.add_requirement(**draft.model_dump(), project_id=...)`.
         Evidence items are passage ids or dicts with "passage_id" (+ "quote").
-        With a project_id, every cited passage must come from a document of
-        that project.
+        project_id is required, the project must exist, and every cited
+        passage must come from a document of that project.
         """
         requirement_id = requirement_id or _new_id()
         try:
@@ -403,7 +431,8 @@ class SQLiteRepository:
         <prefix><n> (zero-padded to `width`) after the highest existing one.
 
         Each row holds add_requirement() keyword arguments (type, statement,
-        priority, evidence, ...); a row's own `requirement_id` is not allowed.
+        priority, evidence, project_id, ...; project_id is required); a row's
+        own `requirement_id` is not allowed.
         Either every row is stored or none is. Returns the new ids in order.
         """
         if any("requirement_id" in row for row in rows):
@@ -447,6 +476,7 @@ class SQLiteRepository:
     ) -> None:
         """INSERT one requirement + its evidence. Must run inside the caller's transaction."""
         self._check_status(status)
+        self._check_project_exists(project_id)
         evidence_list = self._normalize_evidence(evidence)
         values = {
             "id": requirement_id,
@@ -543,9 +573,9 @@ class SQLiteRepository:
                 self._assert_approvable(requirement_id)
 
     def set_requirement_project(
-        self, requirement_id: str, project_id: str | None, *, link_documents: bool = False
+        self, requirement_id: str, project_id: str, *, link_documents: bool = False
     ) -> None:
-        """Assign a requirement to a project (None = unassign).
+        """Move a requirement to another project (e.g. ingested into the wrong one).
 
         Refused (nothing changed) when a cited passage comes from a document
         outside the project, unless link_documents=True, which first adds the
@@ -558,17 +588,12 @@ class SQLiteRepository:
                 "SELECT 1 FROM requirements WHERE id = ?", (requirement_id,)
             ).fetchone() is None:
                 raise RepositoryError(f"Requirement {requirement_id!r} not found")
-            if project_id is not None:
-                if self.conn.execute(
-                    "SELECT 1 FROM projects WHERE id = ?", (project_id,)
-                ).fetchone() is None:
-                    raise RepositoryError(f"Project {project_id!r} not found")
-                if link_documents:
-                    self._link_documents(project_id, self.requirement_document_ids(requirement_id))
+            self._check_project_exists(project_id)
+            if link_documents:
+                self._link_documents(project_id, self.requirement_document_ids(requirement_id))
             other_runs = self.conn.execute(
                 "SELECT s.id FROM srs_runs s JOIN srs_run_requirements sr ON sr.srs_run_id = s.id "
-                "WHERE sr.requirement_id = ? AND s.project_id IS NOT NULL "
-                "AND s.project_id IS NOT ? ORDER BY s.id",
+                "WHERE sr.requirement_id = ? AND s.project_id != ? ORDER BY s.id",
                 (requirement_id, project_id),
             ).fetchall()
             if other_runs:
@@ -593,11 +618,11 @@ class SQLiteRepository:
         return list(dict.fromkeys(r[0] for r in rows))
 
     def project_scope_problems(self, requirement_id: str) -> list[str]:
-        """Cited documents outside the requirement's project; [] when in scope or unassigned."""
+        """Cited documents outside the requirement's project; [] when in scope."""
         row = self.conn.execute(
             "SELECT project_id FROM requirements WHERE id = ?", (requirement_id,)
         ).fetchone()
-        if row is None or row[0] is None:
+        if row is None:
             return []
         linked = {
             r[0]
@@ -651,25 +676,16 @@ class SQLiteRepository:
         feature: str | None = None,
         nfr_category: str | None = None,
         project_id: str | None = None,
-        unassigned: bool = False,
     ) -> list[dict[str, Any]]:
-        """List requirements; every given filter must match.
-
-        unassigned=True keeps only requirements without a project.
-        """
+        """List requirements; every given filter must match."""
         if status is not None:
             self._check_status(status)
-        if unassigned and project_id is not None:
-            raise RepositoryError("Pass project_id or unassigned=True, not both")
         filters = {
             "status": status, "type": type, "feature": feature, "nfr_category": nfr_category,
             "project_id": project_id,
         }
         active = {k: v for k, v in filters.items() if v is not None}
-        conditions = [f"{k} = ?" for k in active]
-        if unassigned:
-            conditions.append("project_id IS NULL")
-        where = " AND ".join(conditions)
+        where = " AND ".join(f"{k} = ?" for k in active)
         rows = self.conn.execute(
             f"SELECT * FROM requirements {'WHERE ' + where if where else ''} "
             "ORDER BY created_at, rowid",
@@ -699,16 +715,15 @@ class SQLiteRepository:
         output_path: str | None = None,
         run_id: str | None = None,
         require_approved: bool = True,
-        project_id: str | None = None,
+        *,
+        project_id: str,
     ) -> str:
-        """Record an SRS run. By default every included requirement must be approved.
-
-        With a project_id, every included requirement must belong to that project.
-        """
+        """Record an SRS run of a project. By default every included requirement
+        must be approved; every one must belong to that project."""
         ids = list(dict.fromkeys(requirement_ids))  # dedupe, keep order
+        self._check_project_exists(project_id)
         self._check_requirements_exist(ids, require_approved=require_approved)
-        if project_id is not None:
-            self._check_requirements_in_project(ids, project_id)
+        self._check_requirements_in_project(ids, project_id)
         run_id = run_id or _new_id()
         try:
             with self.conn:
@@ -734,33 +749,13 @@ class SQLiteRepository:
         if cur.rowcount == 0:
             raise RepositoryError(f"SRS run {run_id!r} not found")
 
-    def set_srs_run_project(self, run_id: str, project_id: str | None) -> None:
-        """Assign an SRS run to a project; all its requirements must belong to it."""
-        with self.conn:
-            run = self.get_srs_run(run_id)
-            if run is None:
-                raise RepositoryError(f"SRS run {run_id!r} not found")
-            if project_id is not None:
-                if self.get_project(project_id) is None:
-                    raise RepositoryError(f"Project {project_id!r} not found")
-                self._check_requirements_in_project(run["requirement_ids"], project_id)
-            self.conn.execute(
-                "UPDATE srs_runs SET project_id = ? WHERE id = ?", (project_id, run_id)
-            )
-
     def get_srs_run(self, run_id: str) -> dict[str, Any] | None:
         row = self.conn.execute("SELECT * FROM srs_runs WHERE id = ?", (run_id,)).fetchone()
         return self._srs_run_from_row(row) if row is not None else None
 
-    def list_srs_runs(
-        self, *, project_id: str | None = None, unassigned: bool = False
-    ) -> list[dict[str, Any]]:
-        """All SRS runs, the runs of one project, or (unassigned=True) runs without one."""
-        if unassigned and project_id is not None:
-            raise RepositoryError("Pass project_id or unassigned=True, not both")
-        if unassigned:
-            where, params = "WHERE project_id IS NULL", []
-        elif project_id is not None:
+    def list_srs_runs(self, *, project_id: str | None = None) -> list[dict[str, Any]]:
+        """All SRS runs, or the runs of one project."""
+        if project_id is not None:
             where, params = "WHERE project_id = ?", [project_id]
         else:
             where, params = "", []
@@ -829,19 +824,25 @@ class SQLiteRepository:
                     f"SRS run includes requirements that are not approved: {not_approved}"
                 )
 
+    def _check_project_exists(self, project_id: str | None) -> None:
+        if project_id is None:
+            raise RepositoryError("project_id is required: every requirement and SRS run belongs to a project")
+        if self.conn.execute("SELECT 1 FROM projects WHERE id = ?", (project_id,)).fetchone() is None:
+            raise RepositoryError(f"Project {project_id!r} not found")
+
     def _check_requirements_in_project(self, ids: Sequence[str], project_id: str) -> None:
         if not ids:
             return
         placeholders = ",".join("?" * len(ids))
         rows = self.conn.execute(
             f"SELECT id FROM requirements WHERE id IN ({placeholders}) "
-            "AND project_id IS NOT ? ORDER BY id",
+            "AND project_id != ? ORDER BY id",
             [*ids, project_id],
         ).fetchall()
         if rows:
             raise RepositoryError(
                 f"SRS run for project {project_id!r} includes requirements of another "
-                f"or no project: {[r[0] for r in rows]}"
+                f"project: {[r[0] for r in rows]}"
             )
 
     def _requirement_from_row(self, row: sqlite3.Row) -> dict[str, Any]:

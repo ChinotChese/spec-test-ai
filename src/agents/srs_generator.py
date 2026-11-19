@@ -26,7 +26,11 @@ Usage:
     srs = srs_generator.generate(requirements)            # app.py step 6
     report = srs_generator.generate_with_report(requirements, project_name="...")
 
-    python -m agents.srs_generator [--project NAME] [--org ORG] [--author NAME] [--out FILE]
+    python -m agents.srs_generator --project-id PRJ-x [--project NAME] [--org ORG]
+                                   [--author NAME] [--out FILE]
+
+All requirements must belong to one project (one SRS = one project); the SRS
+title defaults to that project's name.
 """
 
 from __future__ import annotations
@@ -138,6 +142,7 @@ class GenerationReport:
     documents: list[str]                     # source documents the requirements cite
     warnings: list[str] = field(default_factory=list)
     attempts: int = 1
+    project_id: str | None = None            # the one project all requirements belong to
 
 
 # ------------------------------------------------------------------- public
@@ -169,7 +174,9 @@ def generate_with_report(
 
     `requirements`: approved requirements (Requirement, repository rows, or ids).
     They are re-read from the registry, which is the source of truth: every id
-    must exist, be "approved", and have valid evidence.
+    must exist, be "approved", have valid evidence, and all must belong to the
+    same project (one SRS = one project; checked before any model call).
+    `project_name` defaults to that project's name.
     `template`: optional parsed templates/standard_srs.yaml; its document_control
     values are used as defaults. Document fields never come from the model.
     """
@@ -177,6 +184,8 @@ def generate_with_report(
     repo = repo or SQLiteRepository(config.DB_PATH)
     try:
         reqs = _load_approved(repo, requirements)
+        project = _common_project(repo, reqs)
+        project_name = project_name or project["name"]
         functional = [r for r in reqs if r["type"] == "functional"]
         nonfunctional = [r for r in reqs if r["type"] == "nonfunctional"]
         if not functional:
@@ -217,7 +226,8 @@ def generate_with_report(
     expected = {r["id"] for r in reqs}
     if sorted(requirement_map.values()) != sorted(expected) or set(requirement_map) != srs.requirement_ids():
         raise GenerationError("Requirement mapping is not one-to-one with the approved input")
-    return GenerationReport(srs, requirement_map, [d["id"] for d in documents], warnings, attempt)
+    return GenerationReport(srs, requirement_map, [d["id"] for d in documents], warnings, attempt,
+                            project_id=project["id"])
 
 
 # --------------------------------------------------------------- inputs
@@ -247,6 +257,17 @@ def _load_approved(
     if problems:
         raise GenerationError("Only approved requirements can be used: " + "; ".join(problems))
     return rows
+
+
+def _common_project(repo: SQLiteRepository, reqs: list[dict[str, Any]]) -> dict[str, Any]:
+    """The one project every requirement belongs to; GenerationError otherwise."""
+    projects = sorted({r["project_id"] for r in reqs})
+    if len(projects) > 1:
+        raise GenerationError(
+            f"Requirements span several projects ({', '.join(projects)}); one SRS = one project. "
+            "Use requirement_registry.get_approved(project_id=...)"
+        )
+    return repo.get_project(projects[0])
 
 
 def _group_features(functional: list[dict[str, Any]]) -> list[tuple[str, list[dict[str, Any]]]]:
@@ -502,7 +523,8 @@ if __name__ == "__main__":
             stream.reconfigure(encoding="utf-8", errors="replace")
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description="Generate an SRS from approved requirements.")
-    parser.add_argument("--project")
+    parser.add_argument("--project-id", required=True, help="project whose approved requirements to use")
+    parser.add_argument("--project", help="project name in the SRS (default: the project's name)")
     parser.add_argument("--org")
     parser.add_argument("--author", action="append")
     parser.add_argument("--version", default="1.0")
@@ -513,7 +535,7 @@ if __name__ == "__main__":
 
     try:
         report = generate_with_report(
-            requirement_registry.get_approved(), project_name=args.project,
+            requirement_registry.get_approved(project_id=args.project_id), project_name=args.project,
             organization=args.org, prepared_by=args.author, version=args.version,
         )
     except (GenerationError, requirement_registry.RegistryError) as e:

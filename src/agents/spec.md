@@ -183,7 +183,7 @@ from agents import requirement_extractor
 
 Lỗi không đến từ Gemini, tức lỗi lập trình (ví dụ `RuntimeError`), **không** bị bỏ qua mà được ném ra nguyên dạng.
 
-Extractor không lưu gì, nên muốn xử lý lại tài liệu lỗi thì gọi lại với passage của tài liệu đó, ví dụ `python -m agents.requirement_extractor DOC-…`.
+Extractor không lưu gì, nên muốn xử lý lại tài liệu lỗi thì gọi lại với passage của tài liệu đó, ví dụ `python -m agents.requirement_extractor --project PRJ-… DOC-…`.
 
 ### 1.7 Cấu hình
 
@@ -194,12 +194,14 @@ Extractor không lưu gì, nên muốn xử lý lại tài liệu lỗi thì g�
 
 ### 1.8 Chạy từ dòng lệnh
 
-Chạy từ `src/`. Lệnh đọc passage từ DB (chỉ đọc), in requirement, và **không ghi gì**:
+Chạy từ `src/`. Lệnh đọc passage của **tài liệu thuộc dự án** từ DB (chỉ đọc), in requirement, và **không ghi gì**:
 
 ```bash
-uv run python -m agents.requirement_extractor                     # mọi tài liệu trong DB
-uv run python -m agents.requirement_extractor DOC-bd148209ea0b    # một tài liệu
+uv run python -m agents.requirement_extractor --project PRJ-…                     # mọi tài liệu của dự án
+uv run python -m agents.requirement_extractor --project PRJ-… DOC-bd148209ea0b    # một tài liệu của dự án
 ```
+
+Tài liệu không thuộc dự án thì bị từ chối. Bản thân hàm `extract(passages)` không biết gì về dự án; dự án được gắn khi lưu (`requirement_registry.save_candidates(drafts, project_id=...)`).
 
 ```
 INFO DOC-bd148209ea0b: 133 passages -> 27 requirements (27 FR, 0 NFR), 0 rejected
@@ -382,12 +384,14 @@ Lỗi: mọi trường hợp đều là `GenerationError`, gồm lỗi Gemini (q
 
 ### 2.7 Chạy từ dòng lệnh
 
-Chạy từ `src/`. Lệnh dùng **mọi** requirement đang approve (`requirement_registry.get_approved()`):
+Chạy từ `src/`. Lệnh dùng mọi requirement đang approve **của một dự án** (`requirement_registry.get_approved(project_id=...)`):
 
 ```bash
-uv run python -m agents.srs_generator --project "AI-Powered Customer Support Platform" \
+uv run python -m agents.srs_generator --project-id PRJ-… \
     --org ExampleCorp --author "Alice Example" --out output/srs.json
 ```
+
+`--project-id` là bắt buộc. Tên dự án trong SRS mặc định là tên trong bảng `projects`; `--project "Tên"` để ghi đè. Gọi từ Python, `generate()` từ chối **trước khi gọi model** nếu bộ requirement trải trên nhiều dự án. `GenerationReport.project_id` cho biết dự án.
 
 Lệnh in số feature, số requirement, các tài liệu được trích và warning, rồi ghi SRS dạng JSON ra file (hoặc in ra nếu không có `--out`). Lỗi thì exit code 1.
 
@@ -407,6 +411,6 @@ Chạy trên **bản sao** của DB, với 27 requirement đã approve của tà
 ### 2.9 Giới hạn
 
 - **Cặp stimulus/response và văn xuôi do model viết**, nên vẫn cần người đọc lại trước khi gửi khách. Code chỉ bảo đảm liên kết đúng FR và passage được trích có tồn tại, không bảo đảm câu chữ trung thành với nguồn.
-- **Generator chưa lọc theo dự án.** Database đã có `projects` và `requirements.project_id` ([database/spec.md](../database/spec.md) mục 2.7–2.9, 8) và `repo.get_approved_requirements(project_id)`, nhưng `requirement_registry.get_approved()` và CLI này chưa dùng. `get_approved()` trả mọi requirement đã approve. Hiện DB chứa requirement của hai dự án khác nhau (hai email đề xuất). Nếu approve cả hai, lệnh CLI sẽ sinh **một** SRS trộn hai sản phẩm. Cách tạm thời: chỉ approve requirement của một dự án, hoặc gọi `generate()` với danh sách id đã lọc. `GenerationReport.documents` cho biết SRS dựa trên những tài liệu nào.
+- **Một SRS = một dự án.** Generator dùng requirement đã approve của một dự án (`get_approved(project_id=...)`) và từ chối bộ requirement trải trên nhiều dự án ([database/spec.md](../database/spec.md) mục 2.7–2.9). Nếu nhiều tài liệu cùng một dự án, SRS dựa trên tất cả; `GenerationReport.documents` cho biết SRS dựa trên những tài liệu nào.
 - **Model chỉ được gọi lại một lần.** Tài liệu rất lớn (nhiều passage) có thể vượt giới hạn output và gây `MAX_TOKENS`.
 - **Không lưu kết quả.** Generator không ghi vào `srs_runs` (`repo.add_srs_run`). Việc kiểm tra placeholder còn sót và dò nguồn gốc nằm ở `services/srs_validator.py`, việc xuất file nằm ở `exporters/markdown.py` ([exporters/spec.md](../exporters/spec.md)).
