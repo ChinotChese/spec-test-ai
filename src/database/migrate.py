@@ -18,8 +18,9 @@ Rules for migration files:
   - no BEGIN / COMMIT / PRAGMA inside the file: the runner owns the
     transaction, runs it with foreign keys OFF (needed for table rebuilds) and
     finishes with PRAGMA foreign_key_check before committing;
-  - schema only; data backfills that need a human decision are separate
-    commands (see database.project_backfill).
+  - schema only: a migration must not guess data. If it needs data that is
+    missing (e.g. a NOT NULL column), it fails, is rolled back, and the data
+    is fixed by hand before running it again.
 
 Databases created before this framework (by the old schema.sql) have no
 schema_migrations table. If their layout is exactly migration 001's, `up`
@@ -418,13 +419,6 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {'stamped' if m.version == 1 and st.needs_baseline else 'applied'}  {m.label}")
         after = status(conn)
         print(f"Now at version {after.current} of {after.latest}.")
-        if any(m.name == "projects" for m in done):
-            print(
-                "\nExisting requirements and SRS runs have no project yet. Next:\n"
-                "  python -m database.project_backfill plan     # propose document -> project mapping\n"
-                "  python -m database.project_backfill apply    # assign what is unambiguous\n"
-                "  python -m database.project_backfill review   # what still needs a human"
-            )
         return 0
     finally:
         conn.close()

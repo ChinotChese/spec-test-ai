@@ -1,4 +1,4 @@
-"""Migration framework, 002_projects, project backfill and project-scope rules.
+"""Migration framework, 002_projects, 003_project_id_not_null, project-scope rules.
 
 Run from src/:  python -m unittest discover -s test -t .
 
@@ -15,27 +15,24 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from database import migrate, project_backfill
+from database import migrate
 from database.sqlite_repository import RepositoryError, SQLiteRepository
 from schemas.requirement import Requirement
 
 FR = {"priority": "must", "feature": "Login"}
+LATEST = len(migrate.discover())
 
 
-def build_legacy_db(path: Path) -> None:
-    """Pre-framework database (001 layout, no history) with data covering every backfill case.
+def build_legacy_db(path: Path, *, with_requirements: bool) -> None:
+    """Pre-framework database (001 layout, no history).
 
-    documents A, B, C, D;  requirements:
-      RQ-1  evidence A          -> unambiguous
-      RQ-2  evidence A + B      -> multi-document: review
-      RQ-3  no evidence         -> review
-      RQ-4  evidence C          -> C is mapped to two projects: review
-      RQ-5  evidence D          -> D is in no project: review
-    SRS runs: RUN-1 [RQ-1] -> unambiguous;  RUN-2 [RQ-1, RQ-2] -> review
+    Always: documents A, B with one passage each.
+    with_requirements: RQ-1 (evidence A), RQ-2 (evidence A + B), and SRS run
+    RUN-1 [RQ-1, RQ-2]; none of them has a project, as before 002.
     """
     conn = sqlite3.connect(path)
     conn.executescript(migrate.discover()[0].sql)
-    for doc in "ABCD":
+    for doc in "AB":
         conn.execute(
             "INSERT INTO documents (id, filename, file_hash, file_path) VALUES (?, ?, ?, ?)",
             (f"DOC-{doc}", f"doc_{doc}.md", f"hash-{doc}", f"input/doc_{doc}.md"),
@@ -44,35 +41,25 @@ def build_legacy_db(path: Path) -> None:
             "INSERT INTO source_passages (id, document_id, text) VALUES (?, ?, ?)",
             (f"P-{doc}", f"DOC-{doc}", f"The system shall do thing {doc}."),
         )
-    for rid, status, docs in [
-        ("RQ-1", "approved", "A"), ("RQ-2", "approved", "AB"), ("RQ-3", "pending", ""),
-        ("RQ-4", "pending", "C"), ("RQ-5", "rejected", "D"),
-    ]:
-        conn.execute(
-            "INSERT INTO requirements (id, type, statement, status, priority, feature) "
-            "VALUES (?, 'functional', ?, ?, 'must', 'Login')",
-            (rid, f"The system shall {rid}.", status),
+    if with_requirements:
+        for rid, docs in [("RQ-1", "A"), ("RQ-2", "AB")]:
+            conn.execute(
+                "INSERT INTO requirements (id, type, statement, status, priority, feature) "
+                "VALUES (?, 'functional', ?, 'approved', 'must', 'Login')",
+                (rid, f"The system shall {rid}."),
+            )
+            for doc in docs:
+                conn.execute(
+                    "INSERT INTO requirement_evidence (requirement_id, passage_id, quote) VALUES (?, ?, ?)",
+                    (rid, f"P-{doc}", f"do thing {doc}"),
+                )
+        conn.execute("INSERT INTO srs_runs (id, srs_json) VALUES ('RUN-1', '{}')")
+        conn.executemany(
+            "INSERT INTO srs_run_requirements (srs_run_id, requirement_id, position) VALUES ('RUN-1', ?, ?)",
+            [("RQ-1", 0), ("RQ-2", 1)],
         )
-        for doc in docs:
-            conn.execute(
-                "INSERT INTO requirement_evidence (requirement_id, passage_id, quote) VALUES (?, ?, ?)",
-                (rid, f"P-{doc}", f"do thing {doc}"),
-            )
-    for run, reqs in [("RUN-1", ["RQ-1"]), ("RUN-2", ["RQ-1", "RQ-2"])]:
-        conn.execute("INSERT INTO srs_runs (id, srs_json) VALUES (?, '{}')", (run,))
-        for pos, rid in enumerate(reqs):
-            conn.execute(
-                "INSERT INTO srs_run_requirements (srs_run_id, requirement_id, position) VALUES (?, ?, ?)",
-                (run, rid, pos),
-            )
     conn.commit()
     conn.close()
-
-
-MAPPING = [
-    {"id": "PRJ-1", "name": "Project one", "document_ids": ["DOC-A", "DOC-B", "DOC-C"]},
-    {"id": "PRJ-2", "name": "Project two", "document_ids": ["DOC-C"]},
-]
 
 
 def counts(path: Path) -> dict[str, int]:
@@ -85,6 +72,19 @@ def counts(path: Path) -> dict[str, int]:
         }
     finally:
         conn.close()
+
+
+def version(path: Path) -> int:
+    conn = sqlite3.connect(path)
+    try:
+        return migrate.status(conn).current
+    finally:
+        conn.close()
+
+
+def up(path: Path) -> int:
+    with mock.patch("builtins.print"):
+        return migrate.main(["up", "--db", str(path), "--no-backup"])
 
 
 class TempDirCase(unittest.TestCase):
@@ -102,20 +102,20 @@ class MigrationFrameworkTest(TempDirCase):
         with SQLiteRepository(":memory:") as repo:
             st = migrate.status(repo.conn)
             self.assertTrue(st.up_to_date)
-            self.assertEqual(st.current, st.latest)
+            self.assertEqual(st.current, LATEST)
             self.assertIn("projects", migrate.layout(repo.conn))
             self.assertIn("project_id", migrate.layout(repo.conn)["requirements"])
             self.assertEqual(repo.conn.execute("PRAGMA foreign_keys").fetchone()[0], 1)
 
     def test_legacy_database_is_refused_until_migrated_and_keeps_its_data(self) -> None:
-        build_legacy_db(self.db)
+        build_legacy_db(self.db, with_requirements=True)
         before = counts(self.db)
         with self.assertRaisesRegex(RepositoryError, "migrate up"):
             SQLiteRepository(self.db)
         self.assertEqual(counts(self.db), before)
 
-    def test_up_stamps_baseline_applies_002_and_preserves_data(self) -> None:
-        build_legacy_db(self.db)
+    def test_up_takes_a_backup_stamps_baseline_and_keeps_data(self) -> None:
+        build_legacy_db(self.db, with_requirements=False)  # like the real DB: documents only
         before = counts(self.db)
         with mock.patch("builtins.print"):
             self.assertEqual(migrate.main(["up", "--db", str(self.db)]), 0)
@@ -123,14 +123,12 @@ class MigrationFrameworkTest(TempDirCase):
         self.assertEqual(counts(self.db), before)
         conn = sqlite3.connect(self.db)
         history = conn.execute("SELECT version, baseline FROM schema_migrations ORDER BY version").fetchall()
-        self.assertEqual(history, [(1, 1), (2, 0)])
-        self.assertEqual(conn.execute("SELECT count(*) FROM requirements WHERE project_id IS NOT NULL").fetchone()[0], 0)
         conn.close()
-        with SQLiteRepository(self.db) as repo:  # now opens
-            self.assertEqual(len(repo.list_requirements(unassigned=True)), 5)
+        self.assertEqual(history, [(1, 1)] + [(v, 0) for v in range(2, LATEST + 1)])
+        SQLiteRepository(self.db).close()  # now opens
 
     def test_backup_is_a_full_copy(self) -> None:
-        build_legacy_db(self.db)
+        build_legacy_db(self.db, with_requirements=True)
         copy = migrate.backup(self.db)
         self.assertEqual(counts(copy), counts(self.db))
 
@@ -153,17 +151,18 @@ class MigrationFrameworkTest(TempDirCase):
         return directory
 
     def test_failing_migration_leaves_no_trace(self) -> None:
+        name = f"{LATEST + 1:03d}_broken.sql"
         directory = self._custom_migrations({
-            "003_broken.sql": "CREATE TABLE first_ok (x TEXT);\nALTER TABLE no_such_table ADD COLUMN y TEXT;\n"
+            name: "CREATE TABLE first_ok (x TEXT);\nALTER TABLE no_such_table ADD COLUMN y TEXT;\n"
         })
         conn = sqlite3.connect(self.db)
         conn.execute("PRAGMA foreign_keys = ON")
         with mock.patch.object(migrate, "MIGRATIONS_DIR", directory):
-            with self.assertRaisesRegex(migrate.MigrationError, "003_broken.sql failed"):
+            with self.assertRaisesRegex(migrate.MigrationError, f"{name} failed"):
                 migrate.migrate(conn)
             st = migrate.status(conn)
-        self.assertEqual(st.current, 2)                       # 001 and 002 committed, 003 not
-        self.assertNotIn("first_ok", migrate.layout(conn))    # first statement rolled back
+        self.assertEqual(st.current, LATEST)                  # real ones committed, broken one not
+        self.assertNotIn("first_ok", migrate.layout(conn))    # its first statement rolled back
         self.assertFalse(conn.in_transaction)
         self.assertEqual(conn.execute("PRAGMA foreign_keys").fetchone()[0], 1)
         conn.close()
@@ -187,106 +186,70 @@ class MigrationFrameworkTest(TempDirCase):
         self.assertEqual(migrate.Migration(2, "projects", path).checksum, lf)
 
     def test_transaction_control_in_file_is_rejected(self) -> None:
-        directory = self._custom_migrations({"003_bad.sql": "CREATE TABLE t (x);\nCOMMIT;\n"})
+        directory = self._custom_migrations({f"{LATEST + 1:03d}_bad.sql": "CREATE TABLE t (x);\nCOMMIT;\n"})
         with mock.patch.object(migrate, "MIGRATIONS_DIR", directory):
             with self.assertRaisesRegex(migrate.MigrationError, "COMMIT"):
                 migrate.discover()
 
     def test_trigger_body_is_allowed(self) -> None:
         directory = self._custom_migrations({
-            "003_trigger.sql": "CREATE TRIGGER t AFTER INSERT ON projects\nBEGIN\n"
-                               "  UPDATE projects SET description = 'x' WHERE id = NEW.id;\nEND;\n"
+            f"{LATEST + 1:03d}_trigger.sql": "CREATE TRIGGER t AFTER INSERT ON projects\nBEGIN\n"
+                                             "  UPDATE projects SET description = 'x' WHERE id = NEW.id;\nEND;\n"
         })
         with mock.patch.object(migrate, "MIGRATIONS_DIR", directory):
             conn = sqlite3.connect(":memory:")
             migrate.migrate(conn)
-            self.assertEqual(migrate.status(conn).current, 3)
+            self.assertEqual(migrate.status(conn).current, LATEST + 1)
             conn.close()
 
 
-# ----------------------------------------------------------------- backfill
+# ------------------------------------------------- 003_project_id_not_null
 
 
-class BackfillTest(TempDirCase):
-    def setUp(self) -> None:
-        super().setUp()
-        build_legacy_db(self.db)
+class ProjectIdNotNullTest(TempDirCase):
+    def test_rows_without_project_stop_003_and_nothing_is_lost(self) -> None:
+        build_legacy_db(self.db, with_requirements=True)
+        before = counts(self.db)
+        self.assertEqual(up(self.db), 1)
+        self.assertEqual(version(self.db), 2)                 # 002 applied, 003 rolled back
+        self.assertEqual(counts(self.db), before)
         conn = sqlite3.connect(self.db)
-        migrate.migrate(conn)
+        self.assertNotIn("requirements_new", migrate.layout(conn))
         conn.close()
-        self.repo = SQLiteRepository(self.db)
-        self.addCleanup(self.repo.close)
 
-    def test_apply_assigns_only_unambiguous_rows(self) -> None:
-        report = project_backfill.apply(self.repo, MAPPING)
-        assigned = {(d.kind, d.id): d.project_id for d in report.assigned}
-        self.assertEqual(assigned, {("requirement", "RQ-1"): "PRJ-1", ("srs_run", "RUN-1"): "PRJ-1"})
-        review = {d.id: d for d in report.needs_review}
-        self.assertEqual(set(review), {"RQ-2", "RQ-3", "RQ-4", "RQ-5", "RUN-2"})
-        # Multi-document goes to review even though both documents are in PRJ-1.
-        self.assertIn("cites 2 documents", review["RQ-2"].reason)
-        self.assertEqual(review["RQ-2"].candidate_project_ids, ["PRJ-1"])
-        self.assertIn("no evidence", review["RQ-3"].reason)
-        self.assertIn("shared by several projects", review["RQ-4"].reason)
-        self.assertIn("not linked to any project", review["RQ-5"].reason)
-        self.assertIn("RQ-2", review["RUN-2"].reason)
-        self.assertEqual(report.documents_without_project, ["DOC-D"])
-        self.assertEqual(report.scope_problems, [])
-        self.assertIsNone(self.repo.get_requirement("RQ-2")["project_id"])
+    def test_003_succeeds_once_rows_have_a_project_and_keeps_links_and_order(self) -> None:
+        build_legacy_db(self.db, with_requirements=True)
+        up(self.db)                                           # stops at 2
+        conn = sqlite3.connect(self.db)                       # fix the data by hand
+        conn.execute("INSERT INTO projects (id, name) VALUES ('PRJ-1', 'One')")
+        conn.executemany("INSERT INTO project_documents (project_id, document_id) VALUES ('PRJ-1', ?)",
+                         [("DOC-A",), ("DOC-B",)])
+        conn.execute("UPDATE requirements SET project_id = 'PRJ-1'")
+        conn.execute("UPDATE srs_runs SET project_id = 'PRJ-1'")
+        conn.commit()
+        conn.close()
+        before = counts(self.db)
 
-    def test_apply_is_idempotent(self) -> None:
-        project_backfill.apply(self.repo, MAPPING)
-        second = project_backfill.apply(self.repo, MAPPING)
-        self.assertEqual(second.projects_created, [])
-        self.assertEqual(second.links_added, 0)
-        self.assertEqual(second.assigned, [])
-        self.assertEqual({d.id for d in second.needs_review}, {"RQ-2", "RQ-3", "RQ-4", "RQ-5", "RUN-2"})
-
-    def test_dry_run_changes_nothing(self) -> None:
-        report = project_backfill.apply(self.repo, MAPPING, dry_run=True)
-        self.assertEqual(len(report.assigned), 2)
-        self.assertEqual(self.repo.list_projects(), [])
-        self.assertEqual(len(self.repo.list_requirements(unassigned=True)), 5)
-
-    def test_invalid_mapping_changes_nothing(self) -> None:
-        bad = MAPPING + [{"id": "PRJ-3", "name": "Project three", "document_ids": ["DOC-NOPE"]}]
-        with self.assertRaisesRegex(project_backfill.BackfillError, "DOC-NOPE"):
-            project_backfill.apply(self.repo, bad)
-        self.assertEqual(self.repo.list_projects(), [])
-
-    def test_proposal_is_one_project_per_unlinked_document(self) -> None:
-        proposal = project_backfill.propose_mapping(self.repo)["projects"]
-        self.assertEqual([p["id"] for p in proposal], ["PRJ-A", "PRJ-B", "PRJ-C", "PRJ-D"])
-        self.assertEqual(proposal[0]["document_ids"], ["DOC-A"])
-
-    def test_reviewer_resolves_multi_document_requirement(self) -> None:
-        mapping = [{"id": "PRJ-A", "name": "a", "document_ids": ["DOC-A"]},
-                   {"id": "PRJ-B", "name": "b", "document_ids": ["DOC-B"]}]
-        project_backfill.apply(self.repo, mapping)
-        # DOC-B is not in PRJ-A: refused unless the reviewer confirms it belongs there.
-        with self.assertRaisesRegex(RepositoryError, "DOC-B"):
-            self.repo.set_requirement_project("RQ-2", "PRJ-A")
-        self.assertIsNone(self.repo.get_requirement("RQ-2")["project_id"])
-        self.repo.set_requirement_project("RQ-2", "PRJ-A", link_documents=True)
-        self.assertEqual(self.repo.get_requirement("RQ-2")["project_id"], "PRJ-A")
-        self.assertIn("DOC-B", self.repo.get_project("PRJ-A")["document_ids"])
-        # Now RUN-2's requirements are all in PRJ-A.
-        self.repo.set_srs_run_project("RUN-2", "PRJ-A")
-        self.assertEqual(self.repo.get_srs_run("RUN-2")["project_id"], "PRJ-A")
-        self.assertEqual({d.id for d in project_backfill.review(self.repo).needs_review},
-                         {"RQ-3", "RQ-4", "RQ-5"})
-
-    def test_cli_review_and_assign(self) -> None:
-        project_backfill.apply(self.repo, MAPPING)
-        self.repo.close()
-        db = ["--db", str(self.db)]
-        with mock.patch("builtins.print"):
-            self.assertEqual(project_backfill.main([*db, "review"]), 1)
-            self.assertEqual(project_backfill.main([*db, "assign", "RQ-2", "PRJ-2"]), 1)
-            self.assertEqual(project_backfill.main([*db, "assign", "RQ-2", "PRJ-1"]), 0)
-            self.assertEqual(project_backfill.main([*db, "assign-run", "RUN-2", "PRJ-1"]), 0)
-        self.repo = SQLiteRepository(self.db)
-        self.assertEqual(self.repo.get_requirement("RQ-2")["project_id"], "PRJ-1")
+        self.assertEqual(up(self.db), 0)
+        self.assertEqual(version(self.db), LATEST)
+        self.assertEqual(counts(self.db), before)
+        with SQLiteRepository(self.db) as repo:
+            self.assertEqual([r["id"] for r in repo.list_requirements()], ["RQ-1", "RQ-2"])
+            self.assertEqual(repo.get_requirement("RQ-2")["evidence"][1]["passage_id"], "P-B")
+            self.assertEqual(repo.get_srs_run("RUN-1")["requirement_ids"], ["RQ-1", "RQ-2"])
+            conn = repo.conn
+            self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+            targets = {r[2] for t in ("requirement_evidence", "srs_run_requirements")
+                       for r in conn.execute(f"PRAGMA foreign_key_list({t})")}
+            self.assertEqual(targets, {"requirements", "source_passages", "srs_runs"})
+            with self.assertRaises(sqlite3.IntegrityError):    # NOT NULL is enforced
+                conn.execute("INSERT INTO requirements (id, project_id, type, statement, priority, feature) "
+                             "VALUES ('X', NULL, 'functional', 's', 'must', 'f')")
+            with self.assertRaisesRegex(RepositoryError, "SRS run"):  # FK from srs_run_requirements still works
+                repo.delete_requirement("RQ-1")
+            index_names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
+            self.assertLessEqual({"idx_requirements_status", "idx_requirements_project",
+                                  "idx_srs_runs_project"}, index_names)
 
 
 # -------------------------------------------------------- repository rules
@@ -332,7 +295,7 @@ class ProjectScopeTest(unittest.TestCase):
     def test_srs_run_only_includes_its_project_requirements(self) -> None:
         rid = self.repo.add_requirement("functional", "s", **FR, project_id=self.prj,
                                         evidence=self.ev(self.pa, "log in"), status="approved")
-        with self.assertRaisesRegex(RepositoryError, "another or no project"):
+        with self.assertRaisesRegex(RepositoryError, "another project"):
             self.repo.add_srs_run({}, [rid], project_id=self.other)
         run = self.repo.add_srs_run({}, [rid], project_id=self.prj)
         self.assertEqual(self.repo.list_srs_runs(project_id=self.prj)[0]["id"], run)
@@ -342,11 +305,25 @@ class ProjectScopeTest(unittest.TestCase):
         with self.assertRaisesRegex(RepositoryError, "SRS runs of another project"):
             self.repo.set_requirement_project(rid, self.other)
 
-    def test_existing_callers_without_project_still_work(self) -> None:
-        rid = self.repo.add_requirement("functional", "s", **FR, evidence=self.ev(self.pb, "Reports"))
-        self.repo.set_requirement_status(rid, "approved")
-        self.repo.add_srs_run({}, [rid])
-        self.assertEqual([r["id"] for r in self.repo.list_requirements(unassigned=True)], [rid])
+    def test_move_requirement_to_another_project(self) -> None:
+        rid = self.repo.add_requirement("functional", "s", **FR, project_id=self.prj,
+                                        evidence=self.ev(self.pa, "log in"))
+        with self.assertRaisesRegex(RepositoryError, "not linked to project"):
+            self.repo.set_requirement_project(rid, self.other)   # doc A is not in Q
+        self.assertEqual(self.repo.get_requirement(rid)["project_id"], self.prj)
+        self.repo.set_requirement_project(rid, self.other, link_documents=True)
+        self.assertEqual(self.repo.get_requirement(rid)["project_id"], self.other)
+        self.assertIn(self.doc_a, self.repo.get_project(self.other)["document_ids"])
+        with self.assertRaisesRegex(RepositoryError, "project_id is required"):
+            self.repo.set_requirement_project(rid, None)
+
+    def test_requirement_without_project_is_refused(self) -> None:
+        with self.assertRaisesRegex(RepositoryError, "project_id is required"):
+            self.repo.add_requirement("functional", "s", **FR, project_id=None,
+                                      evidence=self.ev(self.pb, "Reports"))
+        with self.assertRaises(TypeError):  # the keyword itself is required
+            self.repo.add_requirement("functional", "s", **FR, evidence=self.ev(self.pb, "Reports"))
+        self.assertEqual(self.repo.list_requirements(), [])
 
 
 if __name__ == "__main__":

@@ -4,9 +4,8 @@
 
 | File | Vai trò |
 |---|---|
-| [migrations/](migrations/) | Định nghĩa bảng, khóa ngoại, ràng buộc, index, theo phiên bản: `001_initial.sql` (schema phase 1, trước đây là `schema.sql`), `002_projects.sql` |
+| [migrations/](migrations/) | Định nghĩa bảng, khóa ngoại, ràng buộc, index, theo phiên bản: `001_initial.sql` (schema phase 1, trước đây là `schema.sql`), `002_projects.sql`, `003_project_id_not_null.sql` |
 | [migrate.py](migrate.py) | Framework migration: chạy, ghi lịch sử, kiểm tra checksum, backup (mục 7) |
-| [project_backfill.py](project_backfill.py) | Gán dự án cho dữ liệu có từ trước `002_projects`, và hàng đợi review (mục 8) |
 | [sqlite_repository.py](sqlite_repository.py) | Class `SQLiteRepository`: toàn bộ thao tác đọc/ghi |
 | [evidence_rules.py](evidence_rules.py) | Định nghĩa **duy nhất** của "evidence hợp lệ" và hàm chuẩn hóa text `normalize_for_match`, dùng chung cho repository, `services/evidence_validator.py` và `services/document_loader.py` |
 | [init_db.py](init_db.py) | Lệnh tạo và kiểm tra DB (mục 7) |
@@ -235,14 +234,16 @@ Mỗi dòng ghi lại một sự kiện: "dự án X dùng tài liệu Y". Một
 
 Khóa chính là `(project_id, document_id)`. Có index trên `document_id`.
 
-### 2.9 Cột `project_id` trên `requirements` và `srs_runs` (từ migration 002)
+### 2.9 Cột `project_id` trên `requirements` và `srs_runs`
 
 | Cột | Kiểu | Ràng buộc | Ghi chú |
 |---|---|---|---|
-| `requirements.project_id` | TEXT | FK → `projects.id`, `ON DELETE RESTRICT`, cho phép `NULL` | `NULL` = **chưa gán dự án** |
-| `srs_runs.project_id` | TEXT | FK → `projects.id`, `ON DELETE RESTRICT`, cho phép `NULL` | `NULL` = **chưa gán dự án** |
+| `requirements.project_id` | TEXT | **NOT NULL**, FK → `projects.id`, `ON DELETE RESTRICT` | Dự án sở hữu requirement |
+| `srs_runs.project_id` | TEXT | **NOT NULL**, FK → `projects.id`, `ON DELETE RESTRICT` | Dự án của bản SRS |
 
-Hai cột cho phép `NULL` vì hai lý do. Một là `ALTER TABLE ADD COLUMN` của SQLite chỉ nhận cột `REFERENCES` có default `NULL`, nên muốn `NOT NULL` thì phải dựng lại cả bảng. Hai là `NULL` chính là trạng thái "đang chờ review" của các dòng mà backfill không tự gán được (mục 8). Có index trên cả hai cột.
+Mọi requirement và SRS run đều thuộc một dự án. Có index trên cả hai cột.
+
+Lịch sử: migration 002 thêm hai cột này dạng cho phép `NULL`, vì `ALTER TABLE ADD COLUMN` của SQLite không thêm được `NOT NULL` khi không có default khác `NULL`. Migration 003 dựng lại hai bảng với `NOT NULL`. Comment trong `002_projects.sql` còn nhắc tới một lệnh backfill; lệnh này đã bị bỏ trước khi có requirement nào thiếu dự án, và file 002 đã chạy nên được giữ nguyên (mục 7).
 
 ---
 
@@ -261,23 +262,23 @@ Hai cột cho phép `NULL` vì hai lý do. Một là `ALTER TABLE ADD COLUMN` c�
 
 ### 3.2 Ai kiểm tra quy tắc nào
 
-| Quy tắc | Database (FK / CHECK) | Repository (Python) |
-|---|---|---|
-| Passage phải thuộc một document có thật | ✔ | |
-| Evidence phải trỏ tới passage có thật | ✔ | ✔ (để báo lỗi rõ ràng hơn) |
-| SRS run chỉ chứa requirement có thật | ✔ | ✔ (để báo lỗi rõ ràng hơn) |
-| `status` chỉ nhận 3 giá trị hợp lệ | ✔ | ✔ |
-| `type`, `priority`, `verification_method` chỉ nhận giá trị hợp lệ | ✔ | |
-| FR / NFR có đủ field của loại mình và không có field của loại kia | ✔ | |
-| `stimulus_or_condition` và `response` đi theo cặp | ✔ | |
-| `page >= 1`, `srs_json` là JSON hợp lệ | ✔ | |
-| Mỗi file (theo `file_hash`) chỉ được lưu một lần | ✔ (UNIQUE) | ✔ (trả lại id của document đã có) |
-| **SRS run chỉ chứa requirement đã `approved`** | | ✔ (khóa ngoại không diễn tả được điều kiện này) |
-| **Requirement `approved` phải có evidence hợp lệ** (mục 3.3) | | ✔ (kiểm tra trong cùng transaction với thao tác ghi) |
-| Một passage không được liệt kê hai lần trong evidence của một requirement | ✔ (PK) | ✔ |
-| `project_id` trỏ tới project có thật | ✔ | ✔ (để báo lỗi rõ ràng hơn) |
-| **Phạm vi dự án:** requirement có `project_id` thì mọi passage nó trích phải thuộc document đã liên kết với project đó | | ✔ (kiểm tra trong cùng transaction ở `add_requirement`, `update_requirement(evidence=…)`, `set_requirement_project`, `unlink_document`) |
-| **SRS run có `project_id` chỉ chứa requirement của project đó** | | ✔ (`add_srs_run`, `set_srs_run_project`, `set_requirement_project`) |
+| Quy tắc                                                                                                                | Database (FK / CHECK) | Repository (Python)                                                                                                                     |
+| ---------------------------------------------------------------------------------------------------------------------- | --------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| Passage phải thuộc một document có thật                                                                                | ✔                     |                                                                                                                                         |
+| Evidence phải trỏ tới passage có thật                                                                                  | ✔                     | ✔ (để báo lỗi rõ ràng hơn)                                                                                                              |
+| SRS run chỉ chứa requirement có thật                                                                                   | ✔                     | ✔ (để báo lỗi rõ ràng hơn)                                                                                                              |
+| `status` chỉ nhận 3 giá trị hợp lệ                                                                                     | ✔                     | ✔                                                                                                                                       |
+| `type`, `priority`, `verification_method` chỉ nhận giá trị hợp lệ                                                      | ✔                     |                                                                                                                                         |
+| FR / NFR có đủ field của loại mình và không có field của loại kia                                                      | ✔                     |                                                                                                                                         |
+| `stimulus_or_condition` và `response` đi theo cặp                                                                      | ✔                     |                                                                                                                                         |
+| `page >= 1`, `srs_json` là JSON hợp lệ                                                                                 | ✔                     |                                                                                                                                         |
+| Mỗi file (theo `file_hash`) chỉ được lưu một lần                                                                       | ✔ (UNIQUE)            | ✔ (trả lại id của document đã có)                                                                                                       |
+| **SRS run chỉ chứa requirement đã** `approved`                                                                         |                       | ✔ (khóa ngoại không diễn tả được điều kiện này)                                                                                         |
+| **Requirement** `approved` **phải có evidence hợp lệ** (mục 3.3)                                                       |                       | ✔ (kiểm tra trong cùng transaction với thao tác ghi)                                                                                    |
+| Một passage không được liệt kê hai lần trong evidence của một requirement                                              | ✔ (PK)                | ✔                                                                                                                                       |
+| Requirement và SRS run luôn có `project_id`, trỏ tới project có thật                                                   | ✔ (NOT NULL, FK)      | ✔ (để báo lỗi rõ ràng hơn)                                                                                                              |
+| **Phạm vi dự án:** mọi passage requirement trích phải thuộc document đã liên kết với dự án của nó                      |                       | ✔ (kiểm tra trong cùng transaction ở `add_requirement`, `update_requirement(evidence=…)`, `set_requirement_project`, `unlink_document`) |
+| **SRS run chỉ chứa requirement của dự án của nó**                                                                      |                       | ✔ (`add_srs_run`, `set_requirement_project`)                                                                                            |
 
 > **Bắt buộc:** SQLite chỉ kiểm tra khóa ngoại khi mỗi connection bật `PRAGMA foreign_keys = ON`. `SQLiteRepository` tự bật khi khởi tạo. Nếu bạn mở database bằng một công cụ khác (DB Browser, sqlite3 CLI…) thì phải tự bật lệnh này.
 
@@ -293,15 +294,15 @@ stateDiagram-v2
     approved --> [*] : được đưa vào SRS run
 ```
 
-Có thể chuyển giữa 3 trạng thái theo bất kỳ chiều nào, với **một điều kiện cho `approved`**: requirement phải có evidence hợp lệ theo [evidence_rules.py](evidence_rules.py). Nghĩa là có ít nhất 1 evidence, và mọi evidence item đều trỏ tới passage có thật, có quote, và quote nằm trong chính passage đó (sau chuẩn hóa).
+Có thể chuyển giữa 3 trạng thái theo bất kỳ chiều nào, với **một điều kiện cho** `approved`: requirement phải có evidence hợp lệ theo [evidence_rules.py](evidence_rules.py). Nghĩa là có ít nhất 1 evidence, và mọi evidence item đều trỏ tới passage có thật, có quote, và quote nằm trong chính passage đó (sau chuẩn hóa).
 
 Repository kiểm tra điều kiện này **trong cùng transaction** ở mọi đường có thể dẫn tới `approved`. Nếu không đạt, nó raise `RepositoryError` và **không ghi gì**:
 
-| Thao tác | Khi nào bị chặn |
-|---|---|
-| `set_requirement_status(id, "approved")` | Evidence đang lưu không hợp lệ; status giữ nguyên |
+| Thao tác                                                                                               | Khi nào bị chặn                                                 |
+| ------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------- |
+| `set_requirement_status(id, "approved")`                                                               | Evidence đang lưu không hợp lệ; status giữ nguyên               |
 | `add_requirement(..., status="approved")` / `add_requirements_with_sequential_ids` với dòng `approved` | Evidence của dòng đó không hợp lệ; cả thao tác (cả lô) rollback |
-| `update_requirement(id, evidence=…)` trên requirement **đang `approved`** | Evidence mới không hợp lệ; evidence cũ được giữ |
+| `update_requirement(id, evidence=…)` trên requirement **đang** `approved`                              | Evidence mới không hợp lệ; evidence cũ được giữ                 |
 
 Requirement `pending` hoặc `rejected` **được phép** có evidence không hợp lệ; nó chỉ không thể chuyển sang `approved`.
 
@@ -334,7 +335,7 @@ Các hàm đọc trả về `dict`. Riêng requirement và SRS run được bổ
     "verification_method": None,
     "acceptance_measure": None,
     "created_at": "2026-11-16T08:30:12.345Z",
-    "project_id": "PRJ-7f3a...",                   # None = chưa gán dự án
+    "project_id": "PRJ-7f3a...",
     "updated_at": "2026-11-16T09:01:00.000Z",
     "evidence": [                                  # theo thứ tự đã thêm
         {"passage_id": "5525b5f1...", "quote": "log in"},
@@ -348,7 +349,7 @@ Các hàm đọc trả về `dict`. Riêng requirement và SRS run được bổ
     "srs_json": "{...}",                           # chuỗi gốc lưu trong DB
     "srs": {...},                                  # srs_json đã được parse
     "output_path": "output/srs.md",
-    "project_id": "PRJ-7f3a...",                   # None = chưa gán dự án
+    "project_id": "PRJ-7f3a...",
     "created_at": "...",
     "requirement_ids": ["REQ-002", "REQ-001"],     # sắp theo position
 }
@@ -390,14 +391,17 @@ Mọi lỗi vi phạm quy tắc đều raise `RepositoryError`.
 | `link_document(project_id, document_id)` | Thêm document vào project (đã có thì bỏ qua) |
 | `unlink_document(project_id, document_id)` | Gỡ document khỏi project. Bị chặn nếu requirement của project đang trích document đó |
 | `list_project_documents(project_id)` | Các document của project |
+| `update_project(id, *, name=None, description=None)` | Đổi tên và/hoặc mô tả (`None` = giữ nguyên). Tên phải duy nhất |
 | `delete_project(id)` | Xóa project. Bị chặn nếu còn requirement hoặc SRS run |
+
+CLI cho các thao tác này: `python -m services.project_registry` ([services/spec.md](../services/spec.md)).
 
 ### Documents
 
 | Hàm | Mô tả |
 |---|---|
 | `add_document(filename, file_hash, file_path, document_id=None) -> str` | Thêm document. Nếu `file_hash` đã tồn tại thì trả về id cũ, không thêm mới |
-| `save_document_with_passages(document_id, filename, file_hash, file_path, passages) -> str` | Lưu document cùng các passage `[(passage_id, page, text), ...]` **trong một transaction**: lỗi thì không ghi gì cả. Nếu `file_hash` đã tồn tại thì dùng lại id cũ và gắn passage vào đó. Được `services/document_loader.py` sử dụng |
+| `save_document_with_passages(document_id, filename, file_hash, file_path, passages, project_id=None) -> str` | Lưu document cùng các passage `[(passage_id, page, text), ...]`, và liên kết với `project_id` nếu có, **trong một transaction**: lỗi (kể cả project không tồn tại) thì không ghi gì cả. Nếu `file_hash` đã tồn tại thì dùng lại id cũ và gắn passage vào đó. Được `services/document_loader.py` sử dụng |
 | `get_document(document_id)` | Lấy document theo id. Trả `None` nếu không có |
 | `get_document_by_hash(file_hash)` | Lấy document theo hash. Trả `None` nếu không có |
 | `list_documents()` | Danh sách document, sắp theo thời gian tạo |
@@ -415,30 +419,29 @@ Mọi lỗi vi phạm quy tắc đều raise `RepositoryError`.
 
 ### Requirements
 
-| Hàm | Mô tả |
-|---|---|
-| `add_requirement(type, statement, *, priority, evidence=(), feature=None, stimulus_or_condition=None, response=None, nfr_category=None, verification_method=None, acceptance_measure=None, status="pending", project_id=None, requirement_id=None) -> str` | Thêm requirement. Nếu có `project_id` thì mọi evidence phải thuộc document của project đó (mục 3.2). Tên tham số trùng với field của `RequirementDraft`, nên có thể gọi `repo.add_requirement(**draft.model_dump())`. Mỗi phần tử của `evidence` là một chuỗi `passage_id` hoặc một dict `{"passage_id", "quote"}` |
-| `add_requirements_with_sequential_ids(rows, *, prefix, width=4) -> list[str]` | Lưu nhiều requirement **trong một transaction**, cấp id `<prefix><số>` tiếp nối số lớn nhất đang có với cùng prefix (ví dụ `RQ-0040`). Mỗi phần tử của `rows` là dict tham số giống `add_requirement` và không được chứa `requirement_id`. Một dòng lỗi thì không lưu dòng nào. Được `services/requirement_registry.py` sử dụng |
-| `update_requirement(id, *, evidence=None, **fields)` | Sửa các field nội dung (`type`, `statement`, `priority`, `feature`, `stimulus_or_condition`, `response`, `nfr_category`, `verification_method`, `acceptance_measure`). Truyền `None` để xóa giá trị một field. Nếu truyền `evidence` thì danh sách evidence cũ bị **thay toàn bộ**. Đổi `status` phải dùng `set_requirement_status()`. Trên requirement đang `approved`, thay đổi làm evidence không hợp lệ bị từ chối và không ghi gì |
-| `set_requirement_status(id, status)` | Đổi trạng thái. `"approved"` bị từ chối (`RepositoryError`, status giữ nguyên) nếu evidence không hợp lệ (mục 3.3) |
-| `set_requirement_project(id, project_id, *, link_documents=False)` | Gán requirement vào project (`None` = bỏ gán). Bị từ chối nếu requirement trích document ngoài project. `link_documents=True` thêm các document còn thiếu vào project trước; chỉ dùng khi người review đã xác nhận các document đó thuộc project. Cũng bị từ chối nếu requirement nằm trong SRS run của project khác |
-| `requirement_document_ids(id)` | Các document mà evidence của requirement trích tới |
-| `project_scope_problems(id) -> list[str]` | Document bị trích nhưng nằm ngoài project; rỗng nếu đúng phạm vi hoặc chưa gán. Chỉ đọc |
-| `approval_problems(id) -> list[str]` | Lý do evidence đang lưu không hợp lệ; danh sách rỗng là approve được. Chỉ đọc |
-| `get_requirement(id)` | Lấy requirement kèm `evidence` (và `project_id`) |
-| `list_requirements(status=None, *, type=None, feature=None, nfr_category=None, project_id=None, unassigned=False)` | Danh sách requirement. Các bộ lọc được kết hợp bằng AND. `unassigned=True` chỉ lấy requirement chưa có project |
-| `get_approved_requirements(project_id=None)` | Viết tắt của `list_requirements("approved", project_id=...)` |
-| `delete_requirement(id)` | Xóa requirement. Raise lỗi nếu nó đã nằm trong một SRS run |
+| Hàm                                                                                                                                                                                                                                                   | Mô tả                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `add_requirement(type, statement, *, priority, evidence=(), feature=None, stimulus_or_condition=None, response=None, nfr_category=None, verification_method=None, acceptance_measure=None, status="pending", project_id, requirement_id=None) -> str` | Thêm requirement. `project_id` **bắt buộc**: project phải tồn tại và mọi evidence phải thuộc document của project đó (mục 3.2). Tên tham số trùng với field của `RequirementDraft`, nên có thể gọi `repo.add_requirement(**draft.model_dump(), project_id=...)`. Mỗi phần tử của `evidence` là một chuỗi `passage_id` hoặc một dict `{"passage_id", "quote"}`                                                                          |
+| `add_requirements_with_sequential_ids(rows, *, prefix, width=4) -> list[str]`                                                                                                                                                                         | Lưu nhiều requirement **trong một transaction**, cấp id `<prefix><số>` tiếp nối số lớn nhất đang có với cùng prefix (ví dụ `RQ-0040`). Mỗi phần tử của `rows` là dict tham số giống `add_requirement` (phải có `project_id`) và không được chứa `requirement_id`. Một dòng lỗi thì không lưu dòng nào. Được `services/requirement_registry.py` sử dụng                                                                                 |
+| `update_requirement(id, *, evidence=None, **fields)`                                                                                                                                                                                                  | Sửa các field nội dung (`type`, `statement`, `priority`, `feature`, `stimulus_or_condition`, `response`, `nfr_category`, `verification_method`, `acceptance_measure`). Truyền `None` để xóa giá trị một field. Nếu truyền `evidence` thì danh sách evidence cũ bị **thay toàn bộ**. Đổi `status` phải dùng `set_requirement_status()`. Trên requirement đang `approved`, thay đổi làm evidence không hợp lệ bị từ chối và không ghi gì |
+| `set_requirement_status(id, status)`                                                                                                                                                                                                                  | Đổi trạng thái. `"approved"` bị từ chối (`RepositoryError`, status giữ nguyên) nếu evidence không hợp lệ (mục 3.3)                                                                                                                                                                                                                                                                                                                     |
+| `set_requirement_project(id, project_id, *, link_documents=False)` | Chuyển requirement sang dự án khác (ví dụ khi ingest nhầm dự án). Bị từ chối nếu requirement trích document ngoài dự án mới. `link_documents=True` thêm các document còn thiếu vào dự án trước; chỉ dùng khi đã xác nhận các document đó thuộc dự án. Cũng bị từ chối nếu requirement nằm trong SRS run của dự án khác |
+| `requirement_document_ids(id)`                                                                                                                                                                                                                        | Các document mà evidence của requirement trích tới                                                                                                                                                                                                                                                                                                                                                                                     |
+| `project_scope_problems(id) -> list[str]` | Document bị trích nhưng nằm ngoài dự án của requirement; rỗng nếu đúng phạm vi. Chỉ đọc |
+| `approval_problems(id) -> list[str]`                                                                                                                                                                                                                  | Lý do evidence đang lưu không hợp lệ; danh sách rỗng là approve được. Chỉ đọc                                                                                                                                                                                                                                                                                                                                                          |
+| `get_requirement(id)`                                                                                                                                                                                                                                 | Lấy requirement kèm `evidence` (và `project_id`)                                                                                                                                                                                                                                                                                                                                                                                       |
+| `list_requirements(status=None, *, type=None, feature=None, nfr_category=None, project_id=None)` | Danh sách requirement. Các bộ lọc được kết hợp bằng AND |
+| `get_approved_requirements(project_id=None)`                                                                                                                                                                                                          | Viết tắt của `list_requirements("approved", project_id=...)`                                                                                                                                                                                                                                                                                                                                                                           |
+| `delete_requirement(id)`                                                                                                                                                                                                                              | Xóa requirement. Raise lỗi nếu nó đã nằm trong một SRS run                                                                                                                                                                                                                                                                                                                                                                             |
 
 ### SRS runs
 
-| Hàm | Mô tả |
-|---|---|
-| `add_srs_run(srs, requirement_ids, output_path=None, run_id=None, require_approved=True, project_id=None) -> str` | Lưu một lần sinh SRS. `requirement_ids` bị trùng sẽ được gộp, giữ thứ tự xuất hiện đầu tiên. Nếu có `project_id` thì mọi requirement phải thuộc project đó |
-| `set_srs_run_project(run_id, project_id)` | Gán SRS run vào project; mọi requirement của run phải thuộc project đó |
-| `set_srs_output_path(run_id, output_path)` | Ghi đường dẫn file sau khi export |
-| `get_srs_run(run_id)` / `list_srs_runs(*, project_id=None, unassigned=False)` | Lấy một hoặc nhiều SRS run, kèm `srs` đã parse và `requirement_ids` |
-| `delete_srs_run(run_id)` | Xóa SRS run. Requirement vẫn được giữ lại |
+| Hàm                                                                                                             | Mô tả                                                                                                                                                                          |
+| --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `add_srs_run(srs, requirement_ids, output_path=None, run_id=None, require_approved=True, *, project_id) -> str` | Lưu một lần sinh SRS của một project (`project_id` **bắt buộc**). Mọi requirement phải thuộc project đó. `requirement_ids` bị trùng sẽ được gộp, giữ thứ tự xuất hiện đầu tiên |
+| `set_srs_output_path(run_id, output_path)`                                                                      | Ghi đường dẫn file sau khi export                                                                                                                                              |
+| `get_srs_run(run_id)` / `list_srs_runs(*, project_id=None)` | Lấy một hoặc nhiều SRS run, kèm `srs` đã parse và `requirement_ids` |
+| `delete_srs_run(run_id)`                                                                                        | Xóa SRS run. Requirement vẫn được giữ lại                                                                                                                                      |
 
 ---
 
@@ -447,11 +450,15 @@ Mọi lỗi vi phạm quy tắc đều raise `RepositoryError`.
 ```python
 from database.sqlite_repository import SQLiteRepository
 
-with SQLiteRepository("output/spectest.db") as repo:
-    # 1. Ingest tài liệu và lưu passage
+with SQLiteRepository("data/example.db") as repo:
+    # 0. Tạo dự án
+    prj = repo.add_project("Example Portal", project_id="PRJ-example")
+
+    # 1. Ingest tài liệu, lưu passage, liên kết tài liệu với dự án
     doc_id = repo.add_document("spec.pdf", file_hash="sha256:ab12...", file_path="input/spec.pdf")
     p1, p2 = repo.add_passages(doc_id, [(1, "The system shall let users log in."),
                                         (2, "Reports can be exported to PDF.")])
+    repo.link_document(prj, doc_id)
 
     # 2–3. Lưu requirement đã qua kiểm tra evidence, trạng thái ban đầu là pending
     req = repo.add_requirement(
@@ -459,17 +466,18 @@ with SQLiteRepository("output/spectest.db") as repo:
         priority="must",
         feature="Login",
         evidence=[{"passage_id": p1, "quote": "users log in"}],
+        project_id=prj,                # bắt buộc; evidence phải thuộc tài liệu của dự án
         requirement_id="REQ-001",
     )
     # Hoặc lưu thẳng output của extractor:
-    #   repo.add_requirement(**draft.model_dump())     # draft: RequirementDraft
+    #   repo.add_requirement(**draft.model_dump(), project_id=prj)     # draft: RequirementDraft
 
     # 4. Người review duyệt requirement
     repo.set_requirement_status(req, "approved")
 
-    # 5–7. Sinh SRS chỉ từ requirement đã approved
-    approved = repo.get_approved_requirements()
-    run_id = repo.add_srs_run({"title": "SRS v1"}, [r["id"] for r in approved])
+    # 5–7. Sinh SRS chỉ từ requirement đã approved của dự án
+    approved = repo.get_approved_requirements(prj)
+    run_id = repo.add_srs_run({"title": "SRS v1"}, [r["id"] for r in approved], project_id=prj)
     repo.set_srs_output_path(run_id, "output/srs_v1.md")
 
     # Truy vết: passage p1 sinh ra những requirement nào?
@@ -487,6 +495,7 @@ with SQLiteRepository("output/spectest.db") as repo:
   uv run python -m database.init_db --reset    # XÓA file DB và tạo lại (mất toàn bộ dữ liệu)
   uv run python -m database.init_db --db PATH  # dùng file khác
   ```
+
   `init_db` tạo DB mới bằng mọi migration. Với DB đã có, nó chỉ kiểm tra: nếu DB cũ hơn code thì liệt kê migration còn thiếu và trả exit code 1, nếu bảng bị sửa ngoài migration thì liệt kê bảng hoặc cột lệch.
 - **Migration** (chạy từ `src/`):
   ```bash
@@ -498,56 +507,6 @@ with SQLiteRepository("output/spectest.db") as repo:
   - Trong lúc chạy, khóa ngoại được tắt (cần thiết khi phải dựng lại bảng), và cuối mỗi file có `PRAGMA foreign_key_check`. Còn vi phạm thì rollback.
   - `up` tạo backup `spectest.db.bak-<thời điểm UTC>` cạnh file DB trước khi ghi (bỏ qua bằng `--no-backup`). Muốn quay lại phiên bản cũ thì khôi phục từ backup; framework không có downgrade.
   - **DB có từ trước khi có framework** (tạo bằng `schema.sql` cũ, chưa có `schema_migrations`): nếu layout trùng đúng `001_initial.sql` thì `up` ghi `001` là *baseline* (không chạy lại), rồi chạy `002` trở đi. Layout khác (ví dụ còn cột `evidence_json` / `requirement_ids_json`) thì bị từ chối.
-  - **Đổi schema:** thêm file `NNN_ten.sql` kế tiếp. **Không sửa file đã chạy**: checksum (tính trên nội dung đã chuẩn hóa xuống dòng LF, nên `autocrlf` của git không ảnh hưởng) bị lệch thì mọi lệnh đều từ chối. Trong file không được có `BEGIN` / `COMMIT` / `ROLLBACK` / `PRAGMA` ở mức câu lệnh, vì runner quản lý transaction (`BEGIN … END` trong thân trigger thì được phép). Migration chỉ chứa schema. Backfill dữ liệu cần người quyết định thì làm bằng lệnh riêng, như mục 8.
+  - **Đổi schema:** thêm file `NNN_ten.sql` kế tiếp. **Không sửa file đã chạy**: checksum (tính trên nội dung đã chuẩn hóa xuống dòng LF, nên `autocrlf` của git không ảnh hưởng) bị lệch thì mọi lệnh đều từ chối. Trong file không được có `BEGIN` / `COMMIT` / `ROLLBACK` / `PRAGMA` ở mức câu lệnh, vì runner quản lý transaction (`BEGIN … END` trong thân trigger thì được phép). Migration chỉ chứa schema và không đoán dữ liệu: nếu thiếu dữ liệu (ví dụ cột `NOT NULL` gặp dòng `NULL`), migration lỗi, được rollback, và phiên bản giữ nguyên; sửa dữ liệu rồi chạy lại. Bảng cần đổi ràng buộc cột thì dựng lại theo cách của `003_project_id_not_null.sql` (tạo bảng mới, copy cả `rowid`, xóa bảng cũ, đổi tên, tạo lại index).
 - **Một connection, một luồng:** mỗi `SQLiteRepository` giữ một `sqlite3.Connection`. Mặc định Python không cho dùng chung connection này giữa các thread, nên mỗi thread nên tạo repository riêng.
 - **Yêu cầu SQLite có JSON1:** cột `srs_json` dùng `json_valid`. JSON1 được tích hợp sẵn từ SQLite 3.38. Kiểm tra phiên bản bằng `python -c "import sqlite3; print(sqlite3.sqlite_version)"`.
-
----
-
-## 8. Backfill dự án cho dữ liệu cũ (`project_backfill.py`)
-
-Migration `002_projects` chỉ đổi schema. Sau migration, mọi requirement và SRS run cũ có `project_id = NULL`. Việc tài liệu nào thuộc dự án nào là **quyết định của con người**, nên backfill là một lệnh riêng, đọc một file mapping:
-
-```bash
-uv run python -m database.project_backfill plan              # 1. đề xuất mapping + xem trước (không ghi DB)
-#    sửa src/data/project_mapping.json nếu nhiều tài liệu thuộc cùng một dự án
-uv run python -m database.project_backfill apply --dry-run   # 2. xem kết quả, không ghi gì
-uv run python -m database.project_backfill apply             # 3. backup, rồi áp dụng trong MỘT transaction
-uv run python -m database.project_backfill review            # 4. những gì còn chờ người quyết định
-uv run python -m database.project_backfill assign RQ-0007 PRJ-x [--link-documents]
-uv run python -m database.project_backfill assign-run <run id> PRJ-x
-uv run python -m database.project_backfill projects          # danh sách project, document, số requirement / run
-uv run python -m database.project_backfill link-document | unlink-document PRJ-x <document id>
-```
-
-File mapping mặc định là `src/data/project_mapping.json` (đã gitignore cùng DB, vì tên dự án lấy từ tên file nguồn):
-
-```json
-{"projects": [{"id": "PRJ-...", "name": "...", "description": null, "document_ids": ["DOC-..."]}]}
-```
-
-`plan` đề xuất **mỗi tài liệu chưa thuộc dự án nào là một dự án**. Nếu file mapping đã có, `plan` không ghi đè (trừ khi có `--force`) mà chỉ xem trước file đó.
-
-### 8.1 Quy tắc gán
-
-| Đối tượng | Tự gán khi | Để `NULL` và đưa vào review khi |
-|---|---|---|
-| Requirement | Mọi evidence nằm trong **một** document, và document đó thuộc **đúng một** project | Evidence trải trên **nhiều document**, *kể cả khi các document đó cùng một project*. Không có evidence. Document không thuộc project nào. Document thuộc nhiều project |
-| SRS run | Mọi requirement của run (sau bước trên) cùng thuộc một project | Có requirement chưa gán. Requirement thuộc nhiều project. Run rỗng |
-
-Requirement trích nhiều tài liệu luôn phải được người review xác nhận, vì đó thường là dấu hiệu của một trong hai trường hợp: các tài liệu thật sự cùng một dự án, hoặc extractor đã trộn hai dự án vào một requirement. Chỉ con người phân biệt được hai trường hợp này. `review` in ra lý do, các document bị trích và các project ứng viên (project chứa đủ mọi document được xếp trước).
-
-Người review chọn một trong các cách:
-
-- `assign RQ-x PRJ-y` khi các document đã cùng thuộc `PRJ-y`.
-- `assign RQ-x PRJ-y --link-documents` khi xác nhận các document còn lại cũng thuộc `PRJ-y`. Lệnh liên kết chúng vào project rồi mới gán.
-- Reject hoặc sửa evidence bằng `services.requirement_registry` nếu requirement trộn hai dự án.
-
-Sau đó chạy `assign-run` cho SRS run có requirement vừa được gán.
-
-### 8.2 Bảo đảm
-
-- **Nguyên tử:** `apply` tạo project, liên kết document, gán requirement và SRS run trong **một transaction**. Mapping sai (document không tồn tại, trùng id hoặc tên, id đã có với tên khác) thì không ghi gì, và báo lỗi trước khi tạo backup.
-- **Chạy lại an toàn:** chỉ xét các dòng còn `project_id = NULL`. Project đã có (cùng id và tên) và liên kết đã có thì được bỏ qua.
-- **Không xóa dữ liệu:** backfill chỉ thêm project và liên kết, và chỉ cập nhật `project_id`.
-- **Tự kiểm tra:** sau khi gán, `apply` chạy `PRAGMA foreign_key_check` và kiểm tra phạm vi dự án (mục 3.2) của mọi requirement đã gán. `review` cũng liệt kê requirement đã gán mà trích document ngoài project, ví dụ sau khi ai đó sửa bằng SQL thô.
