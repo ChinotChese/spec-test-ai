@@ -17,7 +17,12 @@ Usage:
     from agents import requirement_extractor
     drafts = requirement_extractor.extract(passages)
 
-    uv run python -m agents.requirement_extractor [DOC-id ...]   # from src/, reads the DB, prints drafts
+    uv run python -m agents.requirement_extractor --project PRJ-... [DOC-id ...]
+        # from src/: reads the project's documents from the DB, prints drafts
+
+extract() itself is project-agnostic: it only sees the passages it is given.
+The project is attached when the drafts are saved
+(requirement_registry.save_candidates(drafts, project_id=...)).
 """
 
 from __future__ import annotations
@@ -271,10 +276,26 @@ if __name__ == "__main__":
             stream.reconfigure(encoding="utf-8", errors="replace")
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
+    import argparse
+
     from database.sqlite_repository import SQLiteRepository
 
+    parser = argparse.ArgumentParser(prog="python -m agents.requirement_extractor",
+                                     description="Extract requirement drafts from a project's documents.")
+    parser.add_argument("--project", required=True, help="project id (services.project_registry)")
+    parser.add_argument("documents", nargs="*", help="only these documents of the project (default: all)")
+    args = parser.parse_args()
+
     with SQLiteRepository(config.DB_PATH) as repo:
-        doc_ids = sys.argv[1:] or [d["id"] for d in repo.list_documents()]
+        project = repo.get_project(args.project)
+        if project is None:
+            logger.error("Project %r not found (python -m services.project_registry list)", args.project)
+            sys.exit(1)
+        outside = [d for d in args.documents if d not in project["document_ids"]]
+        if outside:
+            logger.error("Not documents of %s: %s", args.project, ", ".join(outside))
+            sys.exit(1)
+        doc_ids = args.documents or project["document_ids"]
         all_passages = [p for doc_id in doc_ids for p in repo.list_passages(doc_id)]
     try:
         reports = extract_with_report(all_passages)
