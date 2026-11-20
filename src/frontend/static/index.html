@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SpecTestAI Demo</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <!-- Markdown preview; without network the page falls back to raw text. -->
+  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js" defer></script>
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">S</span>
+      <div>
+        <div class="brand-name">SpecTestAI</div>
+        <div class="brand-sub">Tài liệu nguồn → SRS (IEEE 830) có truy vết</div>
+      </div>
+    </div>
+    <div class="status" id="status"></div>
+    <div class="project-pick">
+      <label for="projectSelect">Dự án</label>
+      <select id="projectSelect"></select>
+    </div>
+  </header>
+
+  <div class="layout">
+    <nav class="steps" id="steps" aria-label="Các bước xử lý"></nav>
+    <main class="panel" id="panel"></main>
+    <aside class="console" aria-label="Nhật ký xử lý">
+      <div class="console-head">
+        <span class="console-title">Nhật ký xử lý</span>
+        <span id="jobInfo" class="job-info"></span>
+        <button class="btn ghost small" id="clearLog" type="button">Xoá</button>
+      </div>
+      <div class="console-body" id="log"><div class="log-empty">Log của từng bước sẽ hiện ở đây.</div></div>
+    </aside>
+  </div>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

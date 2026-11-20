@@ -89,6 +89,7 @@ src/
 │   └── markdown.py
 ├── schemas/               Model Pydantic: RequirementDraft / Requirement, SRS (IEEE 830)
 ├── database/              SQLite: migrations/, migrate, repository, init_db, evidence_rules
+├── frontend/              Giao diện demo local: server.py (thư viện chuẩn) + static/ (HTML/CSS/JS)
 ├── templates/             IEEE_830_SRS_Template.md, standard_srs.yaml (cũng là một phần core context)
 ├── test/                  unittest, chạy offline (Qdrant local trong RAM, Gemini giả)
 ├── input/                 Tài liệu nguồn            (gitignored)
@@ -379,6 +380,20 @@ uv run python -c "import app; print(app.generate_approved_srs('PRJ-…'))"      
 
 `generate_approved_srs()` lấy tên dự án từ bảng `projects`. Tổ chức và tác giả vẫn là placeholder; muốn điền, dùng lệnh CLI ở bước 5.
 
+### Giao diện demo (chạy trên máy local)
+
+```bash
+uv run python -m frontend.server --open      # http://127.0.0.1:8765, Ctrl+C để dừng
+```
+
+Một trang web đi qua từng bước của pipeline cho một dự án: tạo / chọn dự án → tải tài liệu (PDF, DOCX, TXT, MD, **tối đa 10 MB**) và tách đoạn → index Qdrant (có thể bỏ qua) → trích requirement → kiểm tra evidence và lưu → review approve / reject (hiện quote tô sáng trong passage gốc) → sinh SRS → kiểm tra và xuất `.md` (xem trước + tải về). Log của bước đang chạy hiện trực tiếp ở cột bên phải.
+
+- Chỉ dùng thư viện chuẩn của Python, không cần cài thêm. Code: [frontend/server.py](src/frontend/server.py), trang tĩnh trong [frontend/static/](src/frontend/static/).
+- Chỉ lắng nghe trên `127.0.0.1`, **không có xác thực**: không mở ra mạng ngoài.
+- Mỗi lúc chỉ chạy một bước (gọi Gemini / Qdrant); file tải lên được lưu vào `src/input/`, SRS JSON và `.md` vào `src/output/` (đều gitignored).
+- Requirement vừa trích (bước 3) và ánh xạ SRS id → RQ id chỉ giữ trong bộ nhớ server; khởi động lại server thì chạy lại bước 3 trước bước 4. SRS JSON được lưu ra file nên bước 7 vẫn chạy được sau khi khởi động lại.
+- Xem trước Markdown tải `marked` và `DOMPurify` từ CDN; không có mạng thì hiện Markdown thô.
+
 ---
 
 ## 5. Cấu hình
@@ -473,4 +488,4 @@ Các dòng request HTTP của `httpx` không được ghi vào file. Không tạ
 - **BM25 không cắt gốc từ** ("requirement" khác "requirements"); câu truy vấn của generator viết bằng tiếng Anh, nên nhánh BM25 ít giúp với nguồn tiếng Việt (nhánh dense thì đa ngôn ngữ).
 - **Implicit caching của Gemini không trúng lần nào** khi đo với `gemini-3.8-flash` (0/13 request), nên hệ thống dùng explicit cache. Explicit cache có phí lưu theo thời gian; chạy lẻ tẻ thì có thể đặt `GEMINI_CONTEXT_CACHE=off`.
 
-**Test:** `cd src && uv run python -m unittest discover -s test -t .` (87 test, chạy offline: Qdrant local trong RAM, Gemini và retrieval giả). Gồm migration, phạm vi dự án, core context, indexer / hybrid search, bố cục prompt của generator, context cache và log file.
+**Test:** `cd src && uv run python -m unittest discover -s test -t .` (89 test, chạy offline: Qdrant local trong RAM, Gemini và retrieval giả). Gồm migration, phạm vi dự án, core context, indexer / hybrid search, bố cục prompt của generator, context cache, log file và API của giao diện demo.
