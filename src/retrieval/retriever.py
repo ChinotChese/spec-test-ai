@@ -17,6 +17,8 @@ list can only contain passages of that project.
 
 from __future__ import annotations
 
+import logging
+import time
 from collections.abc import Mapping
 from typing import Any, Literal
 
@@ -26,6 +28,8 @@ Mode = Literal["hybrid", "dense", "sparse"]
 MODES = ("hybrid", "dense", "sparse")
 
 PREFETCH_LIMIT = 50  # candidates per retriever before fusion
+
+logger = logging.getLogger(__name__)
 
 _client: Any = None
 
@@ -91,15 +95,25 @@ def _run(
     _check_mode(mode)
     if not queries:
         return []
+    collection = collection or qdrant_store.collection_name()
+    t0 = time.perf_counter()
     vectors: list[list[float] | None] = (
         embedding.embed_queries(queries, client=embed_client) if mode != "sparse" else [None] * len(queries)
     )
+    t1 = time.perf_counter()
     requests = [_request(project_id, q, v, top_k, mode, with_payload) for q, v in zip(queries, vectors)]
     sendable = [r for r in requests if r is not None]
     responses = iter((client or _get_client()).query_batch_points(
-        collection_name=collection or qdrant_store.collection_name(), requests=sendable,
+        collection_name=collection, requests=sendable,
     ) if sendable else [])
-    return [next(responses).points if r is not None else [] for r in requests]
+    results = [next(responses).points if r is not None else [] for r in requests]
+    t2 = time.perf_counter()
+    hits = sum(len(r) for r in results)
+    unique = len({p.id for r in results for p in r})
+    logger.info("retrieval %s: collection=%s project=%s queries=%d top_k=%d hits=%d unique=%d "
+                "empty=%d embed=%.0fms qdrant=%.0fms", mode, collection, project_id, len(queries), top_k,
+                hits, unique, sum(1 for r in results if not r), (t1 - t0) * 1000, (t2 - t1) * 1000)
+    return results
 
 
 def search_points(

@@ -433,6 +433,8 @@ def _select_evidence(
         return passages, EvidenceInfo("fallback_all_passages", len(cited), len(passages) - len(cited),
                                       len(passages), len(queries)), warnings
 
+    for key in queries:
+        logger.debug("retrieval %s -> %s", key, ", ".join(hits.get(key) or []) or "(none)")
     # Rank by rank across queries, so every section / feature gets its best hits first.
     chosen: list[str] = []
     depth = max((len(v) for v in hits.values()), default=0)
