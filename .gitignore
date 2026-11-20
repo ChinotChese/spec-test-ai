@@ -237,3 +237,4 @@ src/data/
 *.db.bak-*
 src/input/
 src/output/
+src/logs/

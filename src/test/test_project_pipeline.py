@@ -14,6 +14,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import config
 from agents import srs_generator
 from database.sqlite_repository import RepositoryError, SQLiteRepository
 from services import document_loader, project_registry, requirement_registry, srs_validator
@@ -38,6 +39,15 @@ def fake_model_draft(features, nonfunctional, passages) -> dict:
             for name, reqs in features
         ],
     }
+
+
+def setUpModule() -> None:
+    # The generator retrieves evidence from Qdrant (network + Gemini embeddings)
+    # and creates a Gemini context cache by default; these tests must stay offline.
+    for patcher in (mock.patch.object(srs_generator, "_retrieve", return_value={}),
+                    mock.patch.object(config, "GEMINI_CONTEXT_CACHE", "off")):
+        patcher.start()
+        unittest.addModuleCleanup(patcher.stop)
 
 
 class PipelineCase(unittest.TestCase):
@@ -150,7 +160,7 @@ class RegistryTest(PipelineCase):
 class GenerateAndValidateTest(PipelineCase):
     def generate(self, requirements):
         with mock.patch.object(srs_generator, "_ask_model",
-                               side_effect=lambda c, m, f, n, p, fb: fake_model_draft(f, n, p)):
+                               side_effect=lambda c, m, f, n, p, fb, **kw: (fake_model_draft(f, n, p), None)):
             return srs_generator.generate_with_report(requirements, repo=self.repo)
 
     def test_generator_refuses_mixed_projects_before_the_model(self) -> None:
@@ -216,7 +226,7 @@ class AppEndToEndTest(unittest.TestCase):
         with mock.patch.object(config, "DB_PATH", db), mock.patch.object(config, "OUTPUT_DIR", out), \
                 mock.patch.object(requirement_extractor, "extract", side_effect=fake_extract), \
                 mock.patch.object(srs_generator, "_ask_model",
-                                  side_effect=lambda c, m, f, n, p, fb: fake_model_draft(f, n, p)):
+                                  side_effect=lambda c, m, f, n, p, fb, **kw: (fake_model_draft(f, n, p), None)):
             saved = app.generate_srs_pipeline([source], prj)
             self.assertEqual(len(saved), 1)
             [row] = requirement_registry.list_by_status("pending", project_id=prj)

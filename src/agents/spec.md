@@ -286,7 +286,7 @@ Sinh SRS theo IEEE 830 (`schemas.srs.SRS`) từ các requirement **đã approve*
 | Document control, revision history | Code | Tham số `project_name`, `organization`, `prepared_by`, `version`; ngày hôm nay. **Không** do model đoán. Thiếu thì dùng placeholder của template (`<Project Name>`, `<Organization>`, `<Author>`) |
 | Mục lục | Code | `build_toc()` |
 | 1.2 Document Conventions | Code | Văn bản cố định mô tả cách đánh số của chính tài liệu (`DOCUMENT_CONVENTIONS`) |
-| 1.5 References | Code | Mỗi tài liệu nguồn mà evidence trích tới là một reference (`REF-001`…): tên file và đường dẫn |
+| 1.5 References | Code | Mỗi tài liệu nguồn là một reference (`REF-001`…): tên file và đường dẫn. Gồm tài liệu mà evidence trích tới, rồi đến tài liệu của passage mà văn xuôi trích (passage do retrieval tìm thêm, mục 2.2) |
 | 3.N / 5.N: tên, thứ tự, priority của feature | Code | Gom FR theo `feature` của registry, theo thứ tự đầu vào. Priority ở 5.N.1 là priority cao nhất trong các FR của feature |
 | 5.N.3: functional requirement | Code | `statement` và `priority` **chép nguyên văn** từ registry; id `REQ-N.M` do code đánh số |
 | 6.N: nonfunctional requirement | Code | Chép nguyên văn `statement`, `priority`, `verification_method`, `acceptance_measure`; id `NF-N.M`; nhóm theo `nfr_category` (mục 2.4) |
@@ -309,7 +309,22 @@ Sinh SRS theo IEEE 830 (`schemas.srs.SRS`) từ các requirement **đã approve*
 | Có ít nhất 1 FR (mục 3 và 5 bắt buộc có feature) | `An SRS needs at least one approved functional requirement …` |
 | Danh sách không rỗng | `No requirements given` |
 
-Model nhận: các requirement đã approve, gom theo feature (kèm cặp stimulus/response nếu registry có), các NFR để làm bối cảnh, và **toàn bộ passage của các tài liệu được trích**.
+Model nhận một prompt dạng **CAG long-context**. Phần cố định đặt trước để có thể cache (xem mục 2.5):
+
+| Thứ tự | Phần | Nội dung |
+|---|---|---|
+| 1 | System instruction (cố định) | `SYSTEM_PROMPT` + core context (`context.core_context`: SRS template, glossary, requirement guidelines). Version của core context nằm trong `GenerationReport.core_context_version` |
+| 2 | `<approved_requirements>` | Requirement đã approve, gom theo feature (kèm cặp stimulus/response nếu registry có), các NFR làm bối cảnh |
+| 3 | `<source_passages>` | Evidence: passage được trích dẫn và passage do retrieval tìm thêm (bên dưới), theo thứ tự đọc (document, rồi passage id) |
+| 4 | Feedback | Chỉ có khi gọi lại lần 2 |
+
+**Chọn evidence:**
+
+- **Cited**: mọi passage mà requirement đã approve trích dẫn. Luôn được gửi, có thuộc tính `cited="true"`.
+- **Retrieved**: hybrid search ([retrieval/spec.md](../retrieval/spec.md)) trong dự án. Mỗi narrative section có một câu truy vấn (`NARRATIVE_QUERIES`; riêng 2.2 dùng truy vấn của feature), mỗi feature có một câu truy vấn (tên feature + các statement). Tất cả câu truy vấn được embed trong 1 lần gọi Gemini và tìm trong 1 lần gọi Qdrant. Mỗi câu truy vấn lấy `SRS_RETRIEVAL_TOP_K` (mặc định 4) passage. Tổng số passage thêm tối đa là `SRS_RETRIEVAL_MAX_PASSAGES` (mặc định 40), lấy lần lượt theo thứ hạng qua các câu truy vấn để section nào cũng có kết quả tốt nhất của mình. Thuộc tính `retrieved_for="purpose,product_scope"` cho model biết passage được tìm cho section nào.
+- **Kiểm tra lại với SQLite**: index Qdrant là dữ liệu dẫn xuất, nên passage không còn tồn tại hoặc không còn thuộc document của dự án bị bỏ, kèm warning.
+- **Fallback**: retrieval lỗi (Qdrant hoặc embedding không truy cập được) thì gửi toàn bộ passage của các tài liệu được trích, như trước khi có retrieval, kèm warning. Retrieval không tìm thấy gì thì chỉ gửi passage được trích dẫn, kèm warning gợi ý chạy indexer.
+- `GenerationReport.evidence` cho biết cách đã dùng (`retrieval` / `cited_only` / `fallback_all_passages`) và số passage mỗi loại.
 
 ### 2.3 Kiểm tra output của model
 
@@ -355,6 +370,35 @@ Quy tắc chính:
 - **Không suy diễn quan hệ hay vai trò** mà nguồn không nêu (gọi sản phẩm là "thay thế" công cụ cũ, gọi ai đó là developer…).
 - Không nhắc id `RQ-` trong văn bản.
 - Thà `unresolved` còn hơn bịa.
+- **Core context** (`<core_context>` ở cuối system instruction) là hướng dẫn **cách viết** (cấu trúc, thuật ngữ, quy tắc), không phải nguồn sự thật về sản phẩm: không lấy dữ kiện từ đó, không trích nó trong `source_ids`. Khi mâu thuẫn, `SYSTEM_PROMPT` thắng.
+
+**Bố cục để cache.** System instruction (`build_system_instruction`) giống nhau từng byte giữa mọi lần gọi có cùng `core_context_version` (khoảng 7.7k token với `gemini-3.8-flash`, trên ngưỡng 4.096 token của implicit caching). Phần thay đổi (requirement, evidence, feedback) nằm sau.
+
+### 2.5.1 Cache reuse
+
+[llm_clients/context_cache.py](../llm_clients/context_cache.py), cấu hình bằng `GEMINI_CONTEXT_CACHE`:
+
+| Giá trị | Cách làm |
+|---|---|
+| `explicit` (mặc định) | System instruction được lưu thành một Gemini cache và tham chiếu bằng tên. Request chỉ gửi requirement + evidence (+ feedback) |
+| `off` | Luôn gửi prompt đầy đủ; implicit caching của Gemini có thể trúng nếu may |
+
+- **Định danh cache**: `display_name = "spectest-<core version>-<sha256(system instruction)[:8]>"`, cộng với model. Core context đổi, `SYSTEM_PROMPT` đổi hoặc đổi model thì dùng cache khác, không bao giờ dùng lại cache cũ.
+- **Vòng đời**: tạo với TTL `GEMINI_CACHE_TTL_SECONDS` (mặc định 600 giây). Mỗi lần dùng lại thì gia hạn thêm một TTL, nên chạy liên tiếp thì cache còn sống, ngừng chạy thì cache tự hết hạn. Cache bị tính phí lưu theo thời gian.
+- **API**: cache chỉ có ở `v1beta` (`GEMINI_CACHE_API_VERSION`). Khi bật cache, generator tạo client `v1beta` cho cả lần gọi model. Request có `cached_content` thì **không được** gửi `system_instruction` (API trả 400), nên `gemini_client.generate_json_with_usage` bỏ field này đi.
+- **Fallback**: không tạo hoặc tìm được cache thì ghi warning và gửi prompt đầy đủ (`cache.mode = "unavailable"`). Cache hết hạn giữa chừng (API trả 403 "CachedContent not found") thì gọi lại lần đó với prompt đầy đủ, ghi warning, và đặt `cache.expired_mid_run = True`.
+- **Đo cache hit**: mọi lần gọi model ghi log `tokens prompt=… cached=… (…%) output=…`, lấy từ `usage_metadata.cached_content_token_count`. `GenerationReport.usage` chứa usage từng lần gọi; `report.cached_tokens` / `report.prompt_tokens` là tổng.
+- **Quản lý**: `python -m llm_clients.context_cache --list` liệt kê, `--clear` xoá các cache `spectest-*`.
+
+Đo trên `gemini-3.8-flash`, 33 requirement, 75 passage:
+
+| | Prompt | Cached | Ghi chú |
+|---|---|---|---|
+| Implicit (Mức 1, 13 request thử, prompt chỉ có prefix 7.6k) | – | 0 / 13 lần trúng | Không dựa vào được |
+| Explicit, lần chạy 1 | 14.685 | 7.707 (52%) | Tạo cache |
+| Explicit, lần chạy 2 | 14.685 | 7.707 (52%) | Dùng lại cache, gia hạn TTL |
+
+Cả hai SRS đều qua `srs_validator`.
 
 ### 2.6 API
 
@@ -365,10 +409,14 @@ from agents import srs_generator
 | Hàm | Mô tả |
 |---|---|
 | `generate(requirements, template=None, **options) -> SRS` | Như `app.py` gọi (`generate(requirements=..., template=...)`) |
-| `generate_with_report(requirements, *, template=None, project_name=None, organization=None, prepared_by=None, version="1.0", date=None, client=None, model=None, repo=None) -> GenerationReport` | Như trên, kèm báo cáo |
+| `generate_with_report(requirements, *, template=None, project_name=None, organization=None, prepared_by=None, version="1.0", date=None, client=None, model=None, repo=None, retrieval=True, retrieve=None, cache=None) -> GenerationReport` | Như trên, kèm báo cáo |
 
 - `template`: dict đã parse từ `templates/standard_srs.yaml` (không bắt buộc). Nếu có, `document_control` của nó được dùng làm giá trị mặc định. Generator không tự đọc YAML, vì `.venv` hiện chưa có PyYAML.
 - `repo`: mặc định mở `config.DB_PATH`. `client`: mặc định tạo Gemini client; có thể truyền client giả khi test.
+- `retrieval=False`: chỉ gửi passage được trích dẫn, không gọi Qdrant hay embedding.
+- `retrieve(project_id, {key: query}) -> {key: [passage_id, …]}`: thay hybrid search mặc định (dùng trong test, để không gọi mạng).
+- `cache`: `True`/`False` bật/tắt explicit cache cho lần gọi này; `None` theo `GEMINI_CONTEXT_CACHE` (mục 2.5.1).
+- Core context thiếu, rỗng hoặc lỗi encoding thì raise `GenerationError("Core context unavailable: …")` trước khi gọi model.
 
 `GenerationReport`:
 
@@ -376,9 +424,14 @@ from agents import srs_generator
 |---|---|
 | `srs` | `schemas.srs.SRS` đã validate |
 | `requirement_map` | `{"REQ-1.1": "RQ-0013", …}` |
-| `documents` | Id các tài liệu nguồn được trích |
-| `warnings` | Những gì đã bị bỏ hoặc chuyển thành `unresolved` (mục 2.3) |
+| `documents` | Id các tài liệu trong 1.5 References |
+| `warnings` | Những gì đã bị bỏ hoặc chuyển thành `unresolved` (mục 2.3), và cảnh báo retrieval (mục 2.2) |
 | `attempts` | 1 hoặc 2 |
+| `project_id` | Dự án của SRS |
+| `core_context_version` | Version của core context trong prompt, ví dụ `core-7dbbe17fa93dafa6` |
+| `evidence` | `EvidenceInfo(mode, cited, retrieved, sent, queries)` |
+| `cache` | `CacheInfo(mode, name, display_name, created, tokens, expired_mid_run)` |
+| `usage` | `list[gemini_client.Usage]`, mỗi lần gọi model một phần tử: `prompt_tokens`, `cached_tokens`, `output_tokens`, `cached_content`. `cached_tokens` / `prompt_tokens` của report là tổng |
 
 Lỗi: mọi trường hợp đều là `GenerationError`, gồm lỗi Gemini (quota, response bị cắt, HTTP 4xx…), đầu vào không hợp lệ, và output vẫn sai sau 2 lần gọi. Generator **không lưu** SRS vào `srs_runs`.
 
@@ -408,9 +461,16 @@ Chạy trên **bản sao** của DB, với 27 requirement đã approve của tà
   Hai lỗi sau được sửa bằng quy tắc mới trong prompt; lần chạy 2 không còn lỗi nào trong ba lỗi này.
 - **Sequence:** đọc thủ công, các cặp stimulus/response chỉ diễn đạt lại FR, giữ đúng giá trị cụ thể (mốc 24h/48h), không có hành vi mới.
 
+**Sau khi có CAG + retrieval** (dự án có 2 tài liệu, 231 passage, 33 requirement đã approve):
+
+- Prompt gửi 75 passage (40 được trích dẫn + 35 do retrieval tìm thêm, 27 câu truy vấn), thay vì toàn bộ 231 passage của 2 tài liệu.
+- SRS hợp lệ ngay lần gọi đầu: 15 feature, 33 requirement; `srs_validator` không báo lỗi.
+- 11/13 narrative `specified` (2.4 `unresolved`, 4.2 `not_applicable`). 8 section có trích passage mà chỉ retrieval mới tìm ra, tức là không nằm trong evidence của requirement nào.
+
 ### 2.9 Giới hạn
 
 - **Cặp stimulus/response và văn xuôi do model viết**, nên vẫn cần người đọc lại trước khi gửi khách. Code chỉ bảo đảm liên kết đúng FR và passage được trích có tồn tại, không bảo đảm câu chữ trung thành với nguồn.
 - **Một SRS = một dự án.** Generator dùng requirement đã approve của một dự án (`get_approved(project_id=...)`) và từ chối bộ requirement trải trên nhiều dự án ([database/spec.md](../database/spec.md) mục 2.7–2.9). Nếu nhiều tài liệu cùng một dự án, SRS dựa trên tất cả; `GenerationReport.documents` cho biết SRS dựa trên những tài liệu nào.
+- **Chất lượng văn xuôi phụ thuộc vào index.** Passage không có trong Qdrant (chưa chạy `python -m retrieval.indexer` sau khi ingest) thì không được retrieval tìm thấy. Câu truy vấn cố định bằng tiếng Anh, nên nhánh BM25 ít giúp được với nguồn tiếng Việt; nhánh dense thì đa ngôn ngữ.
 - **Model chỉ được gọi lại một lần.** Tài liệu rất lớn (nhiều passage) có thể vượt giới hạn output và gây `MAX_TOKENS`.
 - **Không lưu kết quả.** Generator không ghi vào `srs_runs` (`repo.add_srs_run`). Việc kiểm tra placeholder còn sót và dò nguồn gốc nằm ở `services/srs_validator.py`, việc xuất file nằm ở `exporters/markdown.py` ([exporters/spec.md](../exporters/spec.md)).

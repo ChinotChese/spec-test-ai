@@ -297,8 +297,7 @@ def _main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8", errors="replace")
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    from app_logging import setup_cli_logging
+
+    setup_cli_logging("requirement_registry")
     sys.exit(_main(sys.argv[1:]))

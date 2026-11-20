@@ -14,6 +14,30 @@ So the SRS can contain no requirement that is not an approved registry
 requirement: the model has no field to write one. Every SRS requirement maps to
 exactly one approved RQ- id (GenerationReport.requirement_map).
 
+Prompt (CAG long context, prompts/srs_prompt.py), stable part first:
+  1. system instruction: SYSTEM_PROMPT + core context (context.core_context:
+     SRS template, glossary, requirement guidelines). Its version is in
+     GenerationReport.core_context_version.
+  2. approved requirements (grouped by feature, NFRs listed).
+  3. evidence passages:
+       cited     - every passage an approved requirement cites (always sent);
+       retrieved - hybrid search (retrieval.retriever) in the project, one
+                   query per narrative section and per feature, top
+                   SRS_RETRIEVAL_TOP_K each, at most SRS_RETRIEVAL_MAX_PASSAGES
+                   extra passages, taken rank by rank across the queries.
+     If retrieval fails (Qdrant / embedding unavailable), every passage of
+     the cited documents is sent instead, with a warning (the pre-retrieval
+     behaviour). GenerationReport.evidence says which mode was used.
+
+Cache reuse (llm_clients.context_cache), GEMINI_CONTEXT_CACHE:
+  explicit (default) - part 1 is stored as a Gemini cache named after the core
+                       context version and reused across calls and runs;
+                       requests then send only parts 2-3. If the cache cannot
+                       be created, or expires mid-run, the full prompt is sent.
+  off                - the full prompt every time (implicit caching may hit).
+Every model call's token usage, including cached tokens, is in
+GenerationReport.usage; GenerationReport.cache says what was used.
+
 Checks on the model's answer (one retry with feedback, then GenerationError):
   - each listed feature present once, with a description and >= 1 sequence;
   - a sequence linking an id that is not a requirement of that feature is dropped;
@@ -41,14 +65,15 @@ import logging
 import sys
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, Field, ValidationError, create_model
 
 import config
 from database.sqlite_repository import SQLiteRepository
-from llm_clients import gemini_client
-from prompts.srs_prompt import SYSTEM_PROMPT, build_user_prompt
+from context.core_context import CoreContextError, load_core_context
+from llm_clients import context_cache, gemini_client
+from prompts.srs_prompt import SYSTEM_PROMPT, build_system_instruction, build_user_prompt
 from schemas.requirement import Requirement
 from schemas.srs import SRS, build_toc
 
@@ -82,6 +107,25 @@ DOCUMENT_CONVENTIONS = (
     "Source ids refer to passages of the source documents listed in 1.5 References. "
     "Sections marked unresolved are not covered by the source documents."
 )
+
+# One retrieval query per narrative section (2.2 Product Features is covered by
+# the per-feature queries). English: dense embeddings are multilingual; BM25
+# only helps for sources that use the same English terms.
+NARRATIVE_QUERIES: dict[str, str] = {
+    "purpose": "purpose of the product and the scope of this release",
+    "intended_audience_and_reading_suggestions": "stakeholders, readers and roles involved in the project",
+    "product_scope": "product goals, objectives, benefits and business value",
+    "product_perspective": "product context and origin: new product, replacement or extension of existing systems",
+    "user_classes_and_characteristics": "user groups and roles who use the system, their needs and expertise",
+    "operating_environment": "operating environment: platforms, devices, browsers, hosting, operating systems",
+    "design_and_implementation_constraints": "constraints: required technologies, standards, regulations, policies, deadlines, budget",
+    "user_documentation": "user documentation, manuals, training and help",
+    "assumptions_and_dependencies": "assumptions and dependencies on external parties, systems or decisions",
+    "user_interfaces_overview": "user interface, screens, dashboards and channels users interact through",
+    "hardware_interfaces": "hardware devices such as scanners, printers, terminals or sensors",
+    "software_interfaces": "integrations with external software systems, APIs and data exchange",
+}
+_FEATURE_QUERY_CHARS = 1000
 
 _PRIORITY_RANK = {"must": 0, "should": 1, "could": 2, "wont": 3}
 _MAX_ATTEMPTS = 2
@@ -136,6 +180,25 @@ RESPONSE_SCHEMA: dict[str, Any] = SrsDraft.model_json_schema()
 
 
 @dataclass
+class EvidenceInfo:
+    mode: str                     # "retrieval" | "cited_only" | "fallback_all_passages"
+    cited: int = 0                # passages cited by the approved requirements
+    retrieved: int = 0            # extra passages added by retrieval
+    sent: int = 0                 # passages in the prompt
+    queries: int = 0              # retrieval queries run
+
+
+@dataclass
+class CacheInfo:
+    mode: str                     # "explicit" | "off" | "unavailable" (creation failed)
+    name: str | None = None       # cachedContents/... when explicit
+    display_name: str | None = None
+    created: bool = False         # True: created by this run; False: reused
+    tokens: int | None = None     # tokens stored in the cache
+    expired_mid_run: bool = False  # the cache vanished; later calls sent the full prompt
+
+
+@dataclass
 class GenerationReport:
     srs: SRS
     requirement_map: dict[str, str]          # SRS id (REQ-1.1 / NF-1.1) -> registry id (RQ-0013)
@@ -143,6 +206,18 @@ class GenerationReport:
     warnings: list[str] = field(default_factory=list)
     attempts: int = 1
     project_id: str | None = None            # the one project all requirements belong to
+    core_context_version: str | None = None  # context.core_context version in the prompt
+    evidence: EvidenceInfo | None = None     # how the evidence passages were chosen
+    cache: CacheInfo | None = None           # context cache used for the stable prefix
+    usage: list[gemini_client.Usage] = field(default_factory=list)  # one per model call
+
+    @property
+    def cached_tokens(self) -> int:
+        return sum(u.cached_tokens for u in self.usage)
+
+    @property
+    def prompt_tokens(self) -> int:
+        return sum(u.prompt_tokens for u in self.usage)
 
 
 # ------------------------------------------------------------------- public
@@ -169,6 +244,9 @@ def generate_with_report(
     client: Any = None,
     model: str | None = None,
     repo: SQLiteRepository | None = None,
+    retrieval: bool = True,
+    retrieve: Callable[[str, dict[str, str]], dict[str, list[str]]] | None = None,
+    cache: bool | None = None,
 ) -> GenerationReport:
     """Generate and validate an SRS; see the module docstring for the rules.
 
@@ -179,7 +257,18 @@ def generate_with_report(
     `project_name` defaults to that project's name.
     `template`: optional parsed templates/standard_srs.yaml; its document_control
     values are used as defaults. Document fields never come from the model.
+    `retrieval`: False sends only the cited passages (no Qdrant / embedding call).
+    `retrieve(project_id, {key: query}) -> {key: [passage_id, ...]}` replaces
+    the default hybrid search (tests).
+    `cache`: use an explicit context cache for the stable prefix; None follows
+    GEMINI_CONTEXT_CACHE.
     """
+    try:
+        core = load_core_context()
+    except CoreContextError as e:
+        raise GenerationError(f"Core context unavailable: {e}") from e
+    system_instruction = build_system_instruction(core.render())
+
     own_repo = repo is None
     repo = repo or SQLiteRepository(config.DB_PATH)
     try:
@@ -194,18 +283,41 @@ def generate_with_report(
                 "(sections 3 and 5 require a feature)"
             )
         features = _group_features(functional)
-        documents = _cited_documents(repo, reqs)
-        passages = [p for doc in documents for p in repo.list_passages(doc["id"])]
+        passages, evidence, warnings = _select_evidence(
+            repo, project["id"], reqs, features, retrieval, retrieve or _retrieve)
+        documents_by_id = {d: repo.get_document(d) for d in dict.fromkeys(p["document_id"] for p in passages)}
     finally:
         if own_repo:
             repo.close()
 
     control = _document_control(template, project_name, organization, prepared_by, version, date)
     passage_ids = {p["id"] for p in passages}
-    warnings: list[str] = []
+    model = model or config.GEMINI_MODEL_GENERATOR
+    use_cache = config.GEMINI_CONTEXT_CACHE == "explicit" if cache is None else cache
+    cache_info, handle = CacheInfo("off"), None
+    if use_cache:
+        try:
+            client = client or gemini_client.make_client(api_version=config.GEMINI_CACHE_API_VERSION)
+            handle = context_cache.get_or_create(client, model=model, system_instruction=system_instruction,
+                                                 version=core.version)
+            cache_info = CacheInfo("explicit", handle.name, handle.display_name, handle.created, handle.tokens)
+        except (context_cache.ContextCacheError, gemini_client.GeminiError) as e:
+            warnings.append(f"explicit context cache unavailable ({e}); sent the full prompt")
+            cache_info = CacheInfo("unavailable")
+    usage: list[gemini_client.Usage] = []
     feedback: list[str] | None = None
+    logger.info("SRS prompt: core context %s, %d approved requirements, evidence %s "
+                "(%d cited + %d retrieved = %d passages)", core.version, len(reqs), evidence.mode,
+                evidence.cited, evidence.retrieved, evidence.sent)
     for attempt in range(1, _MAX_ATTEMPTS + 1):
-        draft = _ask_model(client, model, features, nonfunctional, passages, feedback)
+        draft, call_usage = _ask_model(client, model, features, nonfunctional, passages, feedback,
+                                       system_instruction=system_instruction,
+                                       cached_content=handle.name if handle else None)
+        if call_usage is not None:
+            usage.append(call_usage)
+            if handle and call_usage.cached_content is None:  # cache expired during the run
+                warnings.append(f"context cache {handle.name} expired during the run; sent the full prompt")
+                cache_info.expired_mid_run, handle = True, None
         problems, attempt_warnings, cleaned = _check_draft(draft, features, passage_ids)
         if not problems:
             warnings.extend(attempt_warnings)
@@ -217,6 +329,7 @@ def generate_with_report(
             f"Model output still invalid after {_MAX_ATTEMPTS} attempts: {'; '.join(problems)}"
         )
 
+    documents = _referenced_documents(reqs, cleaned, passages, documents_by_id)
     srs_dict, requirement_map = _assemble(control, cleaned, features, nonfunctional, documents)
     try:
         srs = SRS.model_validate(srs_dict)
@@ -227,7 +340,8 @@ def generate_with_report(
     if sorted(requirement_map.values()) != sorted(expected) or set(requirement_map) != srs.requirement_ids():
         raise GenerationError("Requirement mapping is not one-to-one with the approved input")
     return GenerationReport(srs, requirement_map, [d["id"] for d in documents], warnings, attempt,
-                            project_id=project["id"])
+                            project_id=project["id"], core_context_version=core.version,
+                            evidence=evidence, cache=cache_info, usage=usage)
 
 
 # --------------------------------------------------------------- inputs
@@ -277,10 +391,103 @@ def _group_features(functional: list[dict[str, Any]]) -> list[tuple[str, list[di
     return list(groups.items())
 
 
-def _cited_documents(repo: SQLiteRepository, reqs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    passage_ids = [e["passage_id"] for r in reqs for e in r["evidence"]]
-    doc_ids = list(dict.fromkeys(p["document_id"] for p in repo.get_passages(passage_ids)))
-    return [repo.get_document(d) for d in doc_ids]
+def _retrieve(project_id: str, queries: dict[str, str]) -> dict[str, list[str]]:
+    """Default retrieval: hybrid search in the project's passages."""
+    from retrieval import retriever
+    return retriever.search_many(project_id, queries, config.SRS_RETRIEVAL_TOP_K,
+                                 mode=config.SRS_RETRIEVAL_MODE)
+
+
+def _retrieval_queries(features: list[tuple[str, list[dict[str, Any]]]]) -> dict[str, str]:
+    queries = dict(NARRATIVE_QUERIES)
+    for name, reqs in features:
+        text = f"{name}: " + " ".join(r["statement"] for r in reqs)
+        queries[f"feature:{name}"] = text[:_FEATURE_QUERY_CHARS]
+    return queries
+
+
+def _select_evidence(
+    repo: SQLiteRepository,
+    project_id: str,
+    reqs: list[dict[str, Any]],
+    features: list[tuple[str, list[dict[str, Any]]]],
+    retrieval: bool,
+    retrieve: Callable[[str, dict[str, str]], dict[str, list[str]]],
+) -> tuple[list[dict[str, Any]], EvidenceInfo, list[str]]:
+    """Passages for the prompt: cited evidence + retrieved, in document order."""
+    warnings: list[str] = []
+    cited = {p["id"]: p for p in repo.get_passages(_evidence_ids(reqs))}
+    budget = config.SRS_RETRIEVAL_MAX_PASSAGES
+    if not retrieval or budget <= 0:
+        passages = _ordered(cited.values(), set(cited), {})
+        return passages, EvidenceInfo("cited_only", len(cited), 0, len(passages)), warnings
+
+    queries = _retrieval_queries(features)
+    try:
+        hits = retrieve(project_id, queries)
+    except Exception as e:  # Qdrant / Gemini down, index missing: keep the old behaviour
+        warnings.append(f"retrieval failed ({type(e).__name__}: {e}); "
+                        "sent every passage of the cited documents instead")
+        doc_ids = list(dict.fromkeys(p["document_id"] for p in cited.values()))
+        passages = _ordered([p for d in doc_ids for p in repo.list_passages(d)], set(cited), {})
+        return passages, EvidenceInfo("fallback_all_passages", len(cited), len(passages) - len(cited),
+                                      len(passages), len(queries)), warnings
+
+    for key in queries:
+        logger.debug("retrieval %s -> %s", key, ", ".join(hits.get(key) or []) or "(none)")
+    # Rank by rank across queries, so every section / feature gets its best hits first.
+    chosen: list[str] = []
+    depth = max((len(v) for v in hits.values()), default=0)
+    for rank in range(depth):
+        for key in queries:
+            ids = hits.get(key) or []
+            if (rank < len(ids) and len(chosen) < budget
+                    and ids[rank] not in cited and ids[rank] not in chosen):
+                chosen.append(ids[rank])
+
+    # The index is derived data: keep only passages that still exist and
+    # still belong to one of this project's documents.
+    project_docs = {d["id"] for d in repo.list_project_documents(project_id)}
+    retrieved = {p["id"]: p for p in repo.get_passages(chosen) if p["document_id"] in project_docs}
+    if dropped := len(chosen) - len(retrieved):
+        warnings.append(f"{dropped} retrieved passages no longer exist in this project "
+                        "(stale index: run python -m retrieval.indexer --prune); ignored")
+    if not any(hits.values()):
+        warnings.append("retrieval found no passages for this project; is the index built? "
+                        "(python -m retrieval.indexer)")
+
+    retrieved_for: dict[str, list[str]] = {}
+    for key, ids in hits.items():
+        for pid in ids:
+            if pid in cited or pid in retrieved:
+                retrieved_for.setdefault(pid, []).append(key)
+    passages = _ordered([*cited.values(), *retrieved.values()], set(cited), retrieved_for)
+    return passages, EvidenceInfo("retrieval", len(cited), len(retrieved), len(passages),
+                                  len(queries)), warnings
+
+
+def _ordered(
+    passages: Iterable[dict[str, Any]], cited: set[str], retrieved_for: dict[str, list[str]]
+) -> list[dict[str, Any]]:
+    """Reading order (document, then passage id), annotated for the prompt."""
+    unique = {p["id"]: p for p in passages}
+    return [
+        {**p, "cited": p["id"] in cited, "retrieved_for": retrieved_for.get(p["id"], [])}
+        for p in sorted(unique.values(), key=lambda p: (p["document_id"], p["id"]))
+    ]
+
+
+def _referenced_documents(
+    reqs: list[dict[str, Any]],
+    cleaned: dict[str, Any],
+    passages: list[dict[str, Any]],
+    documents_by_id: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """1.5 References: documents of the requirements' evidence first, then of
+    any other passage a narrative section cites."""
+    doc_of = {p["id"]: p["document_id"] for p in passages}
+    used = _evidence_ids(reqs) + [sid for n in cleaned["narratives"].values() for sid in n["source_ids"]]
+    return [documents_by_id[d] for d in dict.fromkeys(doc_of[sid] for sid in used if sid in doc_of)]
 
 
 def _document_control(
@@ -305,23 +512,39 @@ def _document_control(
 # ----------------------------------------------------------------- model
 
 
-def _ask_model(client, model, features, nonfunctional, passages, feedback) -> dict[str, Any]:
+def _ask_model(client, model, features, nonfunctional, passages, feedback, *,
+               system_instruction: str = SYSTEM_PROMPT,
+               cached_content: str | None = None) -> tuple[dict[str, Any], gemini_client.Usage]:
+    """One model call; returns (parsed draft, token usage).
+
+    With `cached_content`, the system instruction comes from that cache. If the
+    cache is gone (expired / deleted), the call is repeated once with the full
+    system instruction; the returned usage then has cached_content None.
+    """
+    request = {
+        "name": "SRS",
+        "model": model or config.GEMINI_MODEL_GENERATOR,
+        "contents": [build_user_prompt(features, nonfunctional, passages, feedback)],
+        "system_instruction": system_instruction,
+        "response_schema": RESPONSE_SCHEMA,
+    }
     try:
-        text = gemini_client.generate_json(
-            client,
-            name="SRS",
-            model=model or config.GEMINI_MODEL_GENERATOR,
-            contents=[build_user_prompt(features, nonfunctional, passages, feedback)],
-            system_instruction=SYSTEM_PROMPT,
-            response_schema=RESPONSE_SCHEMA,
-        )
+        try:
+            result = gemini_client.generate_json_with_usage(client, cached_content=cached_content, **request)
+        except _API_ERRORS as e:
+            if not (cached_content and context_cache.is_cache_missing(e)):
+                raise
+            logger.warning("SRS: context cache %s is gone (HTTP %s); sending the full prompt",
+                           cached_content, e.code)
+            result = gemini_client.generate_json_with_usage(client, **request)
+        text = result.text
     except gemini_client.GeminiError as e:
         raise GenerationError(str(e)) from e
     except _API_ERRORS as e:
         status = f" {e.status}" if e.status else ""
         raise GenerationError(f"SRS: Gemini HTTP {e.code}{status}: {e.message}") from e
     try:
-        return json.loads(text)
+        return json.loads(text), result.usage
     except json.JSONDecodeError as e:
         raise GenerationError(f"SRS: Gemini response is not JSON: {e}") from e
 
@@ -518,10 +741,9 @@ def _references(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
 if __name__ == "__main__":
     import argparse
 
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8", errors="replace")
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    from app_logging import setup_cli_logging
+
+    setup_cli_logging("srs_generator")
     parser = argparse.ArgumentParser(description="Generate an SRS from approved requirements.")
     parser.add_argument("--project-id", required=True, help="project whose approved requirements to use")
     parser.add_argument("--project", help="project name in the SRS (default: the project's name)")
@@ -543,9 +765,16 @@ if __name__ == "__main__":
         sys.exit(1)
     for w in report.warnings:
         logger.warning("%s", w)
-    logger.info("SRS: %d features, %d requirements, documents %s, attempts %d",
+    logger.info("SRS: %d features, %d requirements, documents %s, attempts %d, core context %s, "
+                "evidence %s (%d cited + %d retrieved)",
                 len(report.srs.system_features), len(report.requirement_map),
-                ", ".join(report.documents), report.attempts)
+                ", ".join(report.documents), report.attempts, report.core_context_version,
+                report.evidence.mode, report.evidence.cited, report.evidence.retrieved)
+    logger.info("cache %s%s: %d of %d prompt tokens cached over %d call(s)",
+                report.cache.mode,
+                f" ({'created' if report.cache.created else 'reused'} {report.cache.display_name})"
+                if report.cache.name else "",
+                report.cached_tokens, report.prompt_tokens, len(report.usage))
     payload = report.srs.model_dump_json(indent=2)
     if args.out:
         with open(args.out, "w", encoding="utf-8") as fh:
