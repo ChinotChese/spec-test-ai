@@ -342,10 +342,9 @@ if __name__ == "__main__":
     import json
     import logging
 
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8", errors="replace")
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    from app_logging import setup_cli_logging
+
+    setup_cli_logging("markdown")
     parser = argparse.ArgumentParser(description="Validate an SRS JSON file and export it to Markdown.")
     parser.add_argument("srs_json")
     parser.add_argument("--project", required=True, help="project id the SRS was generated for")

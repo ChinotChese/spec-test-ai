@@ -252,11 +252,9 @@ def _log_report(r: IndexReport) -> None:
 
 
 if __name__ == "__main__":
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8", errors="replace")
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    logging.getLogger("httpx").setLevel(logging.WARNING)  # one INFO line per Qdrant / Gemini request
+    from app_logging import setup_cli_logging
+
+    setup_cli_logging("indexer", quiet_http=True)
     import argparse
 
     parser = argparse.ArgumentParser(prog="python -m retrieval.indexer",

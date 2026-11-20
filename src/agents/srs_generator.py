@@ -741,10 +741,9 @@ def _references(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
 if __name__ == "__main__":
     import argparse
 
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8", errors="replace")
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    from app_logging import setup_cli_logging
+
+    setup_cli_logging("srs_generator")
     parser = argparse.ArgumentParser(description="Generate an SRS from approved requirements.")
     parser.add_argument("--project-id", required=True, help="project whose approved requirements to use")
     parser.add_argument("--project", help="project name in the SRS (default: the project's name)")

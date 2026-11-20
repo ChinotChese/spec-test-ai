@@ -61,6 +61,7 @@ flowchart LR
 src/
 ├── app.py                 Hai hàm pipeline (theo dự án): generate_srs_pipeline(), generate_approved_srs()
 ├── config.py              Đường dẫn, tên model, retry; đọc src/.env
+├── app_logging.py         Log của mọi CLI: console + file theo ngày trong src/logs/
 ├── agents/                Bước dùng LLM để suy luận nội dung
 │   ├── requirement_extractor.py
 │   └── srs_generator.py
@@ -92,6 +93,7 @@ src/
 ├── test/                  unittest, chạy offline (Qdrant local trong RAM, Gemini giả)
 ├── input/                 Tài liệu nguồn            (gitignored)
 ├── data/                  spectest.db               (gitignored)
+├── logs/                  spectest-YYYY-MM-DD.log   (gitignored)
 └── output/                SRS đã xuất               (gitignored)
 ```
 
@@ -290,7 +292,7 @@ Bước này chỉ in kết quả ra màn hình. Mỗi tài liệu được gọ
 Chưa có lệnh CLI riêng cho bước này; dùng hàm pipeline trong `app.py`:
 
 ```bash
-uv run python -c "import logging; logging.basicConfig(level=logging.INFO, format='%(levelname)s %(message)s'); import app; app.generate_srs_pipeline(None, 'PRJ-…')"
+uv run python -c "import app_logging; app_logging.setup_cli_logging('pipeline'); import app; app.generate_srs_pipeline(None, 'PRJ-…')"
 ```
 
 Hàm này chạy lại bước 1 (bỏ qua file đã ingest) và bước 2, rồi:
@@ -324,6 +326,7 @@ uv run python -m agents.srs_generator --project-id PRJ-… \
 ```
 
 ```
+INFO retrieval hybrid: collection=source_passages project=PRJ-… queries=27 top_k=4 hits=108 unique=63 empty=0 embed=1480ms qdrant=897ms
 INFO context cache created: spectest-core-7dbbe17fa93dafa6-f8f2d811 (cachedContents/…, 7707 tokens), expires …
 INFO SRS prompt: core context core-7dbbe17fa93dafa6, 33 approved requirements, evidence retrieval (40 cited + 35 retrieved = 75 passages)
 INFO SRS: tokens prompt=14685 cached=7707 (52%, explicit cache) output=5875
@@ -410,6 +413,20 @@ uv run python -c "import app; print(app.generate_approved_srs('PRJ-…'))"      
 | `SPECTEST_INPUT_DIR` | `src/input` | Thư mục tài liệu nguồn |
 | `SPECTEST_DATA_DIR` / `SPECTEST_DB_PATH` | `src/data` / `src/data/spectest.db` | Vị trí database |
 | `SPECTEST_OUTPUT_DIR` | `src/output` | Thư mục SRS xuất ra |
+| `SPECTEST_LOG_DIR` | `src/logs` | Thư mục log file của các CLI; `off` (hoặc để trống) = chỉ in ra console |
+| `SPECTEST_LOG_LEVEL` | `INFO` | Mức log ghi vào **file**; `DEBUG` thêm danh sách passage tìm được cho từng câu truy vấn. Console luôn ở `INFO` |
+
+### Log
+
+Mọi lệnh `python -m …` vừa in ra console (như trước), vừa **ghi thêm** vào `src/logs/spectest-YYYY-MM-DD.log`. Mỗi ngày một file, các lệnh chạy trong ngày ghi nối vào cùng file. Mỗi dòng có thời gian, tên lệnh và pid để tách các lần chạy:
+
+```
+2026-11-20 07:32:55 INFO [srs_generator 1744] app_logging: start: …/agents/srs_generator.py --project-id PRJ-… (cwd …)
+2026-11-20 07:32:58 INFO [srs_generator 1744] retrieval.retriever: retrieval hybrid: collection=source_passages project=PRJ-… queries=27 …
+2026-11-20 07:33:01 INFO [srs_generator 1744] llm_clients.gemini_client: SRS: tokens prompt=14685 cached=7707 (52%, explicit cache) output=4446
+```
+
+Các dòng request HTTP của `httpx` không được ghi vào file. Không tạo được thư mục log thì chỉ in một warning, lệnh vẫn chạy. Gọi hàm trong `app.py` từ code của bạn thì gọi `app_logging.setup_cli_logging("<tên>")` trước để có log file. File log không tự xoá; dọn thủ công khi cần.
 
 ---
 
@@ -441,6 +458,7 @@ uv run python -c "import app; print(app.generate_approved_srs('PRJ-…'))"      
 - **Các thư mục chứa dữ liệu thật đều được** `.gitignore` **bỏ qua:** `src/input/` (tài liệu nguồn), `src/data/` (DB chứa nguyên văn passage), `src/output/` (SRS chứa trích dẫn nguyên văn), và `src/.env`. Đừng thêm dữ liệu thật vào file được git track, kể cả ví dụ trong tài liệu.
 - **Nội dung tài liệu được gửi tới Gemini API của Google** ở bước 1 (cả file), bước 1b (passage, để embed), bước 2 và bước 5 (các passage). Chỉ dùng với tài liệu được phép gửi cho bên thứ ba.
 - **Qdrant lưu nguyên văn passage** trong payload. Nếu `QDRANT_HOST` là server ở xa thì dữ liệu khách hàng nằm trên server đó. Khi xoá tài liệu khỏi SQLite, chạy `retrieval.indexer --prune` để xoá cả trên Qdrant.
+- **Log file (`src/logs/`) được gitignore và có chứa dữ liệu khách hàng:** tên file nguồn, id tài liệu / passage / requirement, và **trích đoạn tới 100 ký tự** của đoạn văn bị loại khi ingest, của requirement bị loại hoặc có evidence sai. Không đưa log vào git, ticket hay chat công khai.
 - **Gemini context cache chỉ chứa system prompt và core context** (template, glossary, quy tắc), không chứa passage của khách hàng. Cache tự hết hạn sau TTL; `context_cache --clear` để xoá ngay.
 
 ---
@@ -455,4 +473,4 @@ uv run python -c "import app; print(app.generate_approved_srs('PRJ-…'))"      
 - **BM25 không cắt gốc từ** ("requirement" khác "requirements"); câu truy vấn của generator viết bằng tiếng Anh, nên nhánh BM25 ít giúp với nguồn tiếng Việt (nhánh dense thì đa ngôn ngữ).
 - **Implicit caching của Gemini không trúng lần nào** khi đo với `gemini-3.8-flash` (0/13 request), nên hệ thống dùng explicit cache. Explicit cache có phí lưu theo thời gian; chạy lẻ tẻ thì có thể đặt `GEMINI_CONTEXT_CACHE=off`.
 
-**Test:** `cd src && uv run python -m unittest discover -s test -t .` (81 test, chạy offline: Qdrant local trong RAM, Gemini và retrieval giả). Gồm migration, phạm vi dự án, core context, indexer / hybrid search, bố cục prompt của generator và context cache.
+**Test:** `cd src && uv run python -m unittest discover -s test -t .` (87 test, chạy offline: Qdrant local trong RAM, Gemini và retrieval giả). Gồm migration, phạm vi dự án, core context, indexer / hybrid search, bố cục prompt của generator, context cache và log file.

@@ -30,7 +30,6 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import logging
-import sys
 from dataclasses import dataclass
 from typing import Any
 
@@ -126,11 +125,9 @@ if __name__ == "__main__":
 
     from llm_clients import gemini_client
 
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8", errors="replace")
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+    from app_logging import setup_cli_logging
+
+    setup_cli_logging("context_cache", quiet_http=True)
     parser = argparse.ArgumentParser(prog="python -m llm_clients.context_cache",
                                      description="List or delete SpecTestAI Gemini context caches.")
     action = parser.add_mutually_exclusive_group(required=True)

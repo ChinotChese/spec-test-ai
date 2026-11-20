@@ -33,6 +33,11 @@ OUTPUT_DIR = Path(os.getenv("SPECTEST_OUTPUT_DIR", SRC_DIR / "output"))   # expo
 DATA_DIR = Path(os.getenv("SPECTEST_DATA_DIR", SRC_DIR / "data"))         # app state, gitignored
 DB_PATH = Path(os.getenv("SPECTEST_DB_PATH", DATA_DIR / "spectest.db"))
 
+# CLI log files (app_logging): <LOG_DIR>/spectest-YYYY-MM-DD.log. "off" or empty disables.
+_log_dir = os.getenv("SPECTEST_LOG_DIR", str(SRC_DIR / "logs")).strip()
+LOG_DIR: Path | None = None if _log_dir.lower() in ("", "off", "none", "0", "false") else Path(_log_dir)
+LOG_LEVEL = os.getenv("SPECTEST_LOG_LEVEL", "INFO")  # file only; the console stays at INFO
+
 # Gemini. GEMINI_API_KEY is passed to the client explicitly (GOOGLE_API_KEY is not read).
 GEMINI_MODEL_LOADER = os.getenv("GEMINI_MODEL_LOADER", "gemini-3.5-flash-lite")
 GEMINI_MODEL_EXTRACTOR = os.getenv("GEMINI_MODEL_EXTRACTOR", "gemini-3.8-flash")

@@ -122,4 +122,4 @@ Tóm tắt các lựa chọn chính khi xây dựng hệ thống, theo thứ t�
 - **Indexer chưa chạy tự động** sau khi ingest, và requirement extractor chưa dùng retrieval.
 - **BM25 không cắt gốc từ**, và câu truy vấn của generator viết bằng tiếng Anh; cần đánh giá chất lượng retrieval với nguồn tiếng Việt.
 - **Explicit cache có lợi khi chạy nhiều lần trong TTL.** Với một lần chạy đơn lẻ, phí tạo và phí lưu cache có thể lớn hơn phần tiết kiệm; chưa đo chi phí thực tế.
-- Test tự động (`src/test`, unittest, 81 test, chạy offline) phủ migration, phạm vi dự án, core context, indexer / hybrid search, bố cục prompt của generator và context cache.
+- Test tự động (`src/test`, unittest, 87 test, chạy offline) phủ migration, phạm vi dự án, core context, indexer / hybrid search, bố cục prompt của generator, context cache và log file.
